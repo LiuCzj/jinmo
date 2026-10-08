@@ -247,6 +247,29 @@
     padding: 0 0.1em;
   }
 
+  /* ── Mermaid 图表 ── */
+  .md-mermaid-block {
+    margin: 0.8em 0;
+    overflow-x: auto;
+  }
+
+  .md-mermaid {
+    display: flex;
+    justify-content: center;
+  }
+
+  .md-mermaid svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* 渲染完成前 / 语法有误时的占位 */
+  .md-mermaid-raw {
+    color: var(--color-muted-foreground);
+    font-size: 0.9em;
+    text-align: center;
+  }
+
   /* ── 数学公式（MathJax 输出的 mjx-container） ── */
   .md-math-wrap {
     display: inline-block;

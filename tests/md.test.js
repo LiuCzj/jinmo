@@ -55,19 +55,19 @@ it('parseInline: 行内代码 `c` 的 srcStart 指向反引号之内，raw 含�
 });
 
 it('classifyLine: 标题 / 空行 / 围栏 / 引用 / 列表 / 分割线', () => {
-  assert.strictEqual(inline.classifyLine('## 标题', false).type, 'h2');
-  assert.strictEqual(inline.classifyLine('## 标题', false).prefixLen, 3);
-  assert.strictEqual(inline.classifyLine('', false).type, 'blank');
-  assert.strictEqual(inline.classifyLine('   ', false).type, 'blank');
-  assert.strictEqual(inline.classifyLine('```', false).type, 'fence');
-  assert.strictEqual(inline.classifyLine('code', true).type, 'code');
-  assert.strictEqual(inline.classifyLine('> x', false).type, 'quote');
-  assert.strictEqual(inline.classifyLine('- x', false).type, 'ul');
-  assert.strictEqual(inline.classifyLine('- x', false).prefixLen, 2);
-  assert.strictEqual(inline.classifyLine('1. x', false).type, 'ol');
-  assert.strictEqual(inline.classifyLine('1. x', false).marker, '1');
-  assert.strictEqual(inline.classifyLine('---', false).type, 'hr');
-  assert.strictEqual(inline.classifyLine('普通段落', false).type, 'p');
+  assert.strictEqual(inline.classifyLine('## 标题', null).type, 'h2');
+  assert.strictEqual(inline.classifyLine('## 标题', null).prefixLen, 3);
+  assert.strictEqual(inline.classifyLine('', null).type, 'blank');
+  assert.strictEqual(inline.classifyLine('   ', null).type, 'blank');
+  assert.strictEqual(inline.classifyLine('```', null).type, 'fence');
+  assert.strictEqual(inline.classifyLine('code', '```').type, 'code');
+  assert.strictEqual(inline.classifyLine('> x', null).type, 'quote');
+  assert.strictEqual(inline.classifyLine('- x', null).type, 'ul');
+  assert.strictEqual(inline.classifyLine('- x', null).prefixLen, 2);
+  assert.strictEqual(inline.classifyLine('1. x', null).type, 'ol');
+  assert.strictEqual(inline.classifyLine('1. x', null).marker, '1');
+  assert.strictEqual(inline.classifyLine('---', null).type, 'hr');
+  assert.strictEqual(inline.classifyLine('普通段落', null).type, 'p');
 });
 
 it('listPrefixOf: 有序序号自增，无序沿用符号', () => {
@@ -428,6 +428,20 @@ it('parseInline: ==x== 单独成片段', () => {
 it('parseInline: 落单的 == 当普通文本', () => {
   const segs = inline.parseInline('a == b');
   assert.ok(!segs.some((s) => s.kind === 'hl'));
+});
+
+console.log('\n[新增] 围栏识别');
+
+it('classifyLine: 闭围栏也认成 fence，否则后面整篇会被误判成代码', () => {
+  assert.strictEqual(inline.classifyLine('```', '```').type, 'fence');
+  assert.strictEqual(inline.classifyLine('```js', null).type, 'fence');
+  assert.strictEqual(inline.classifyLine('正文', '```').type, 'code');
+  assert.strictEqual(inline.classifyLine('正文', null).type, 'p');
+});
+
+it('classifyLine: 四个反引号的围栏不被内层三个反引号闭合', () => {
+  assert.strictEqual(inline.classifyLine('```', '````').type, 'code');
+  assert.strictEqual(inline.classifyLine('````', '````').type, 'fence');
 });
 
 console.log('\n──────────────────────────────');

@@ -459,11 +459,20 @@ export interface LineKind {
  * 判定一行的块类型与前缀长度。
  *
  * @param line 一行源码
- * @param inFence 该行是否位于代码围栏内部，由调用方按行序维护
+ * @param fence 当前所处围栏的标记（如 ``` 或 ````）；不在围栏内传 null
  * @returns 块类型与前缀长度
  */
-export function classifyLine(line: string, inFence: boolean): LineKind {
-  if (inFence) return { type: 'code', prefixLen: 0 };
+export function classifyLine(line: string, fence: string | null): LineKind {
+  // 围栏行必须最先判：闭围栏也得认出来，否则调用方的状态永远翻不回去，
+  // 代码块之后的整篇正文都会被误判成代码
+  const fm = /^\s*(`{3,}|~{3,})/.exec(line);
+  if (fm) {
+    // CommonMark：N 个反引号的围栏只能被 ≥N 个同种标记闭合，否则它是内容（四反引号里能放三反引号）
+    if (fence === null || (fm[1][0] === fence[0] && fm[1].length >= fence.length)) {
+      return { type: 'fence', prefixLen: fm[0].length };
+    }
+  }
+  if (fence !== null) return { type: 'code', prefixLen: 0 };
   if (line.trim() === '') return { type: 'blank', prefixLen: 0 };
 
   let m: RegExpExecArray | null;
@@ -473,7 +482,6 @@ export function classifyLine(line: string, inFence: boolean): LineKind {
     return { type: key, prefixLen: m[0].length };
   }
   if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) return { type: 'hr', prefixLen: line.length };
-  if (/^\s*```/.test(line)) return { type: 'fence', prefixLen: /^\s*```\w*\s*/.exec(line)?.[0].length ?? 3 };
   if ((m = /^(\s*)>\s?/.exec(line))) return { type: 'quote', prefixLen: m[0].length };
   const lp = listPrefixOf(line);
   if (lp) return { type: lp.ordered ? 'ol' : 'ul', prefixLen: lp.len, marker: lp.marker };

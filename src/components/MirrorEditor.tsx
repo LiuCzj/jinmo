@@ -21,6 +21,7 @@ import { charColsForLine, classifyLine, parseInline, revealSegAt, type InlineSeg
 import { highlightCode } from '@/lib/md-code';
 import { highlightMarkdown } from '@/lib/md-highlight';
 import { renderMath } from '@/lib/md-math';
+import { renderMermaid } from '@/lib/md-mermaid';
 import { parseMarkdownFile, type ParsedMarkdownFile } from '@/lib/parse-md-file';
 import {
   backspace,
@@ -93,11 +94,13 @@ interface RenderLine {
   prefixText: string;
   /** 表格行的列数（取表头的列数，head/sep/body 三种行都有值） */
   tableCols?: number;
-  /** 代码块的语言标识，取自围栏后的第一个词；仅 code 行有 */
+  /** 代码块的语言标识，取自围栏后的第一个词；code 行与 fence 行都有 */
   lang?: string;
   /** 块级公式的 TeX 源码；只挂在块的首行 */
   mathTex?: string;
-  /** 块级公式的起止行号；块内每一行都有 */
+  /** Mermaid 图表源码；只挂在块的首行 */
+  diagram?: string;
+  /** 块级内容（公式 / 图表）的起止行号；块内每一行都有 */
   mathBlockFirst?: number;
   mathBlockLast?: number;
 }
@@ -184,7 +187,8 @@ function buildLines(src: string): RenderLine[] {
   const raw = src.split('\n');
   const out: RenderLine[] = [];
   let pos = 0;
-  let inFence = false;
+  /** 当前所处的代码围栏标记（如 ``` 或 ````）；null = 不在围栏内 */
+  let fence: string | null = null;
   /** 当前代码围栏的语言标识 */
   let fenceLang = '';
 
@@ -196,11 +200,15 @@ function buildLines(src: string): RenderLine[] {
   }
 
   for (const line of raw) {
-    const kind = classifyLine(line, inFence);
+    const kind = classifyLine(line, fence);
     if (kind.type === 'fence') {
-      // 只有开围栏那一行带语言，闭围栏不动
-      if (!inFence) fenceLang = (/^\s*(?:```|~~~)\s*(\S+)/.exec(line)?.[1] ?? '').toLowerCase();
-      inFence = !inFence;
+      if (fence === null) {
+        // 开围栏：记下标记与语言（闭围栏不动这两个值）
+        fence = /^\s*(`{3,}|~{3,})/.exec(line)?.[1] ?? '```';
+        fenceLang = (/^\s*(?:`{3,}|~{3,})\s*(\S+)/.exec(line)?.[1] ?? '').toLowerCase();
+      } else {
+        fence = null;
+      }
     }
     const prefixText = line.slice(0, kind.prefixLen);
     const body = line.slice(kind.prefixLen);
@@ -255,7 +263,12 @@ function buildLines(src: string): RenderLine[] {
       kind,
       prefixText,
       segs,
-      lang: kind.type === 'code' ? fenceLang : undefined,
+      lang:
+        kind.type === 'code'
+          ? fenceLang
+          : kind.type === 'fence'
+            ? (/^\s*(?:`{3,}|~{3,})\s*(\S+)/.exec(line)?.[1] ?? '').toLowerCase()
+            : undefined,
     });
     pos += line.length + 1;
   }
@@ -294,6 +307,25 @@ function buildLines(src: string): RenderLine[] {
     }
   }
 
+  // 图表块：```mermaid 围栏里的内容整块渲染成一张图，非编辑态下只占首行高度
+  for (let i = 0; i < out.length; i++) {
+    const fence = out[i];
+    if (fence.kind.type !== 'fence' || fence.lang !== 'mermaid') continue;
+    const body: string[] = [];
+    let j = i + 1;
+    while (j < out.length && out[j].kind.type === 'code') {
+      body.push(out[j].src);
+      j++;
+    }
+    if (j >= out.length || out[j].kind.type !== 'fence') continue; // 没有闭合围栏，按普通代码块处理
+    fence.diagram = body.join('\n');
+    for (let k = i; k <= j; k++) {
+      out[k].mathBlockFirst = i;
+      out[k].mathBlockLast = j;
+    }
+    i = j;
+  }
+
   // 复用没变的行对象（见函数注释）。引用定义变了就不复用，避免拿到过期的链接解析结果
   const defsKey = JSON.stringify(defs);
   const merged =
@@ -311,6 +343,7 @@ function buildLines(src: string): RenderLine[] {
           if (
             p.lang !== l.lang ||
             p.mathTex !== l.mathTex ||
+            p.diagram !== l.diagram ||
             p.mathBlockFirst !== l.mathBlockFirst ||
             p.mathBlockLast !== l.mathBlockLast
           ) {
@@ -541,7 +574,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         const nb = lineEls.current[li - 1] ?? lineEls.current[li + 1];
         if (!nb) return null;
         const nr = nb.getBoundingClientRect();
-        return { x: 0, y: nr.top - wr.top, h: nr.height };
+        return { x: nr.left - wr.left, y: nr.top - wr.top, h: nr.height };
       }
       const el = lineEls.current[li];
       if (!el) return null;
@@ -549,10 +582,10 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       const col = Math.max(0, Math.min(abs - line.start, line.src.length));
       const er = el.getBoundingClientRect();
 
-      // 空行没有可见字符，光标摆在行首
-  // hr 为编辑态时整行按源码渲染，需走字符映射而非直接摆到行首
+      // 空行没有可见字符，光标摆在正文起始处。
+      // 不能给 0 —— 那是容器的左边缘（在内边距之外），会跑到正文左边去
       if (line.kind.type === 'blank') {
-        return { x: 0, y: er.top - wr.top, h: er.height };
+        return { x: er.left - wr.left, y: er.top - wr.top, h: er.height };
       }
 
       /**
@@ -2512,6 +2545,35 @@ function MathTex({ tex, display }: { tex: string; display: boolean }) {
   );
 }
 
+/**
+ * Mermaid 图表。
+ *
+ * 异步渲染：加载完成前先占位，避免图表出现时把下面的内容顶走。
+ *
+ * @param source 图表源码
+ */
+function MermaidDiagram({ source }: { source: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    setSvg(null);
+    setFailed(false);
+    void renderMermaid(source).then((r) => {
+      if (!alive) return;
+      if (r) setSvg(r);
+      else setFailed(true);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [source]);
+
+  if (svg) return <div className="md-mermaid" dangerouslySetInnerHTML={{ __html: svg }} />;
+  return <div className="md-mermaid-raw">{failed ? '图表语法有误，或渲染失败' : '正在渲染图表…'}</div>;
+}
+
 /** 行内图片；加载失败时浏览器会显示 alt，这里只补破图样式 */
 function InlineImage({ href, alt }: { href: string; alt: string }) {
   const [broken, setBroken] = useState(false);
@@ -2604,9 +2666,15 @@ const EditorLine = memo(function EditorLine({
     >
       {l.mathBlockFirst !== undefined && !mathEditing ? (
         l.mathBlockFirst === i ? (
-          <div className="md-math-block">
-            <MathTex tex={l.mathTex ?? ''} display />
-          </div>
+          l.diagram !== undefined ? (
+            <div className="md-mermaid-block">
+              <MermaidDiagram source={l.diagram} />
+            </div>
+          ) : (
+            <div className="md-math-block">
+              <MathTex tex={l.mathTex ?? ''} display />
+            </div>
+          )
         ) : null
       ) : l.kind.type === 'blank' ? (
         /* 空行 = 段落间距（Typora 0.8em），不是一整行高 —— 整行高会让每个块之间都多出一条空白 */
