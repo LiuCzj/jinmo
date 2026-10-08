@@ -23,6 +23,7 @@ pnpm-debug.log*
 temp/
 cache/
 AGENT.md
+# 以下两个文件已删除，规则保留：万一再建，也不会把本机路径提交上去
 DOWNLOADS.md
 requirements.txt
 

@@ -15,6 +15,7 @@ const inline = require('./build/md-inline.js');
 const edit = require('./build/md-editing.js');
 const cmd = require('./build/md-commands.js');
 const hl = require('./build/md-highlight.js');
+const code = require('./build/md-code.js');
 
 let passed = 0;
 let failed = 0;
@@ -314,6 +315,31 @@ it('highlightMarkdown: 代码围栏内部不再解析行内标记', () => {
 
 it('highlightMarkdown: 输出行数与原文本一致（含空行）', () => {
   assert.strictEqual(hl.highlightMarkdown('a\n\nb').length, 3);
+});
+
+console.log('\n[新增] 代码块着色');
+
+it('highlightCode: 关键字 / 字符串 / 注释分别着色', () => {
+  const html = code.highlightCode('const a = "hi"; // 注释', 'js');
+  assert.ok(html.includes('md-code-kw'));
+  assert.ok(html.includes('md-code-str'));
+  assert.ok(html.includes('md-code-com'));
+});
+
+it('highlightCode: HTML 特殊字符被转义', () => {
+  const html = code.highlightCode('if (a < b && c > d)', 'js');
+  assert.ok(html.includes('&lt;') && html.includes('&amp;'));
+  assert.ok(!html.includes('<b'));
+});
+
+it('highlightCode: Python 的 # 注释被识别', () => {
+  const html = code.highlightCode('x = 1  # 说明', 'python');
+  assert.ok(html.includes('md-code-com'));
+});
+
+it('highlightCode: 未知语言不抛错，原文保留', () => {
+  const html = code.highlightCode('随便写点什么', 'no-such-lang');
+  assert.ok(html.includes('随便写点什么'));
 });
 
 console.log('\n──────────────────────────────');

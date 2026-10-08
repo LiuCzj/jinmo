@@ -4,7 +4,7 @@
  * 使用 CommonJS 而非 TypeScript：这是独立于渲染层的薄壳，省掉一套编译步骤。
  */
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -12,6 +12,42 @@ const path = require('node:path');
 if (!ipcMain) {
   console.error('必须以 Electron 启动，且不要设置 ELECTRON_RUN_AS_NODE。');
   process.exit(1);
+}
+
+// 本地图片协议：jinmo-file://local/?p=<encodeURIComponent(路径)>
+// 必须在 app ready 之前声明
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'jinmo-file', privileges: { standard: true, secure: true, supportFetchAPI: true } },
+]);
+
+/** 当前打开文件所在目录，用于解析文档里的相对图片路径 */
+let currentDir = process.cwd();
+
+const IMAGE_MIME = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+};
+
+/** 读取本地图片；绝对路径直接用，相对路径按当前文件所在目录解析 */
+function handleLocalImage(request) {
+  const raw = new URL(request.url).searchParams.get('p') ?? '';
+  if (!raw) return new Response('', { status: 400 });
+  const abs = path.isAbsolute(raw) ? raw : path.resolve(currentDir, raw);
+  try {
+    const data = fs.readFileSync(abs);
+    return new Response(data, {
+      headers: { 'content-type': IMAGE_MIME[path.extname(abs).toLowerCase()] ?? 'application/octet-stream' },
+    });
+  } catch {
+    return new Response('', { status: 404 });
+  }
 }
 
 // 数据目录（窗口状态、最近文件、Chromium 缓存）：默认跟随系统；
@@ -25,6 +61,12 @@ const DEV = process.argv.includes('--dev');
 const SELFTEST = process.argv.includes('--selftest');
 const DEV_URL = 'http://localhost:5173';
 const PROD_HTML = path.join(__dirname, '..', 'dist', 'markdown-editor.html');
+
+/** `--open <文件>`：启动后直接打开该文件 */
+const OPEN_ARG = (() => {
+  const i = process.argv.indexOf('--open');
+  return i >= 0 ? process.argv[i + 1] : null;
+})();
 
 // 自检常在无 GPU 的环境里跑，关掉硬件加速并放宽沙箱，否则 GPU 进程崩溃会拖垮整个应用
 if (SELFTEST) {
@@ -105,6 +147,7 @@ function readFileSafe(filePath) {
 function deliverFile(filePath) {
   const content = readFileSafe(filePath);
   if (content === null) return false;
+  currentDir = path.dirname(filePath);
   pushRecent(filePath);
   buildMenu();
   win?.webContents.send('open-file', { path: filePath, content });
@@ -169,6 +212,7 @@ function buildMenu() {
       label: '视图',
       submenu: [
         { label: '源码模式', accelerator: 'CmdOrCtrl+/', click: send('toggle-source') },
+        { label: '大纲', accelerator: 'CmdOrCtrl+Shift+O', click: send('toggle-outline') },
         { type: 'separator' },
         { label: '专注模式', accelerator: 'F8', click: send('toggle-focus') },
         { label: '打字机模式', accelerator: 'F9', click: send('toggle-typewriter') },
@@ -184,7 +228,7 @@ function buildMenu() {
       label: '帮助',
       submenu: [
         { label: '关于', click: showAbout },
-        { label: '项目主页', click: () => shell.openExternal('https://github.com/') },
+        { label: '项目主页', click: () => shell.openExternal('https://github.com/LiuCzj/jinmo') },
       ],
     },
   ];
@@ -254,10 +298,24 @@ function createWindow() {
     win.loadFile(PROD_HTML);
   }
 
+  win.webContents.once('did-finish-load', () => {
+    if (OPEN_ARG) deliverFile(path.resolve(OPEN_ARG));
+  });
+
   // 自检：启动后截图存到 temp/ 再退出，用于无人值守验证
   if (SELFTEST) {
     win.webContents.once('did-finish-load', async () => {
       await new Promise((r) => setTimeout(r, 2500));
+      // 报告每个 <img> 的加载结果，便于无人值守判断相对路径 / 绝对路径 / 缺图三种情况
+      const imgs = await win.webContents.executeJavaScript(
+        `[...document.querySelectorAll('img')].map((i) => ({
+           src: i.getAttribute('src'),
+           ok: i.naturalWidth > 0,
+           w: i.naturalWidth,
+           h: i.naturalHeight,
+         }))`,
+      );
+      console.log('SELFTEST_IMAGES ' + JSON.stringify(imgs));
       const image = await win.capturePage();
       const out = path.join(__dirname, '..', 'temp', 'desktop-selftest.png');
       fs.mkdirSync(path.dirname(out), { recursive: true });
@@ -284,6 +342,7 @@ ipcMain.handle('file:open', async () => {
   if (canceled || !filePaths[0]) return null;
   const content = readFileSafe(filePaths[0]);
   if (content === null) return null;
+  currentDir = path.dirname(filePaths[0]);
   pushRecent(filePaths[0]);
   buildMenu();
   return { path: filePaths[0], content };
@@ -306,6 +365,7 @@ ipcMain.handle('file:save', async (_e, { content, filePath }) => {
     dialog.showErrorBox('保存失败', `${target}\n\n${err.message}`);
     return null;
   }
+  currentDir = path.dirname(target);
   pushRecent(target);
   buildMenu();
   win?.setTitle(`${path.basename(target)} — jinmo`);
@@ -322,7 +382,10 @@ ipcMain.handle('title:set', (_e, title) => win?.setTitle(title));
 
 // ── 生命周期 ──────────────────────────────────────────────
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  protocol.handle('jinmo-file', handleLocalImage);
+  createWindow();
+});
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();

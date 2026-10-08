@@ -16,7 +16,9 @@ import {
   useState,
 } from 'react';
 import { charColsForLine, classifyLine, parseInline, revealSegAt, type InlineSeg, type LineKind } from '@/lib/md-inline';
+import { highlightCode } from '@/lib/md-code';
 import { highlightMarkdown } from '@/lib/md-highlight';
+import { renderMath } from '@/lib/md-math';
 import { parseMarkdownFile, type ParsedMarkdownFile } from '@/lib/parse-md-file';
 import {
   backspace,
@@ -89,6 +91,13 @@ interface RenderLine {
   prefixText: string;
   /** 表格行的列数（取表头的列数，head/sep/body 三种行都有值） */
   tableCols?: number;
+  /** 代码块的语言标识，取自围栏后的第一个词；仅 code 行有 */
+  lang?: string;
+  /** 块级公式的 TeX 源码；只挂在块的首行 */
+  mathTex?: string;
+  /** 块级公式的起止行号；块内每一行都有 */
+  mathBlockFirst?: number;
+  mathBlockLast?: number;
 }
 
 /** 光标位置：整篇里的绝对字符下标 */
@@ -160,10 +169,16 @@ function buildLines(src: string): RenderLine[] {
   const out: RenderLine[] = [];
   let pos = 0;
   let inFence = false;
+  /** 当前代码围栏的语言标识 */
+  let fenceLang = '';
 
   for (const line of raw) {
     const kind = classifyLine(line, inFence);
-    if (kind.type === 'fence') inFence = !inFence;
+    if (kind.type === 'fence') {
+      // 只有开围栏那一行带语言，闭围栏不动
+      if (!inFence) fenceLang = (/^\s*(?:```|~~~)\s*(\S+)/.exec(line)?.[1] ?? '').toLowerCase();
+      inFence = !inFence;
+    }
     const prefixText = line.slice(0, kind.prefixLen);
     const body = line.slice(kind.prefixLen);
   /**
@@ -187,11 +202,51 @@ function buildLines(src: string): RenderLine[] {
             rawStart: s.rawStart + kind.prefixLen,
             rawEnd: s.rawEnd + kind.prefixLen,
           }));
-    out.push({ start: pos, src: line, kind, prefixText, segs });
+    out.push({
+      start: pos,
+      src: line,
+      kind,
+      prefixText,
+      segs,
+      lang: kind.type === 'code' ? fenceLang : undefined,
+    });
     pos += line.length + 1;
   }
 
   markTables(out);
+
+  // 块级公式：$$ ... $$（可跨行）。整块渲染成一个公式，非编辑态下只占首行的高度
+  let openAt = -1;
+  let buf: string[] = [];
+  const closeBlock = (endIndex: number) => {
+    const first = out[openAt];
+    if (!first) return;
+    first.mathTex = buf.join('\n').trim();
+    for (let k = openAt; k <= endIndex; k++) {
+      out[k].mathBlockFirst = openAt;
+      out[k].mathBlockLast = endIndex;
+    }
+    openAt = -1;
+    buf = [];
+  };
+  for (let i = 0; i < out.length; i++) {
+    const t = out[i].src.trim();
+    if (openAt === -1) {
+      if (t === '$$') {
+        openAt = i;
+        buf = [];
+      } else if (t.length > 4 && t.startsWith('$$') && t.endsWith('$$')) {
+        out[i].mathTex = t.slice(2, -2).trim();
+        out[i].mathBlockFirst = i;
+        out[i].mathBlockLast = i;
+      }
+    } else if (t === '$$') {
+      closeBlock(i);
+    } else {
+      buf.push(out[i].src);
+    }
+  }
+
   return out;
 }
 
@@ -254,6 +309,7 @@ export interface EditorHandle {
   toggleSource(): void;
   toggleFocus(): void;
   toggleTypewriter(): void;
+  toggleOutline(): void;
 }
 
 export interface MirrorEditorProps {
@@ -266,10 +322,12 @@ export interface MirrorEditorProps {
   onImport?: (r: ParsedMarkdownFile) => void;
   /** 专注 / 打字机模式任一开启时回调 true —— 宿主据此收起页面上的说明、页头等干扰 */
   onImmersiveChange?: (on: boolean) => void;
+  /** 极简外观：去掉外框，状态栏吸底 —— 用于「整个窗口就是编辑器」的宿主 */
+  plain?: boolean;
 }
 
 const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function MirrorEditor(
-  { value, onChange, onSave, onImport, onImmersiveChange },
+  { value, onChange, onSave, onImport, onImmersiveChange, plain },
   ref,
 ) {
   const lines = useMemo(() => buildLines(value), [value]);
@@ -336,6 +394,18 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   const preRef = useRef<HTMLPreElement | null>(null);
   /** 源码模式的逐行着色结果 */
   const sourceHtml = useMemo(() => highlightMarkdown(value), [value]);
+  /** 大纲侧栏是否展开 */
+  const [outlineOpen, setOutlineOpen] = useState(false);
+  /** 大纲条目：级别、文本、行下标 */
+  const headings = useMemo(
+    () =>
+      lines.flatMap((l, i) =>
+        /^h[1-6]$/.test(l.kind.type)
+          ? [{ line: i, level: Number(l.kind.type[1]), text: l.src.replace(/^\s*#{1,6}\s+/, '').trim() }]
+          : [],
+      ),
+    [lines],
+  );
   /** 撤销栈：entries 是逐步快照，index 指向「当前」状态 */
   const historyRef = useRef<{ entries: HistoryEntry[]; index: number }>({ entries: [], index: -1 });
   /** 上一次小编辑落栈的时刻（毫秒），配合 UNDO_MERGE_MS 判断要不要并入同一步 */
@@ -491,6 +561,9 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       const nodes: { node: Text; text: string; decorative: boolean }[] = [];
       let n: Text | null;
       while ((n = walker.nextNode() as Text | null)) {
+        // 跳过 MathJax 输出的文本（SVG 内的 title、mjx-assistive-mml 里的 MathML），
+        // 它们不占源码列 —— 渲染成公式后可见文本只剩我们补的那个隐藏占位
+        if (n.parentElement?.closest('mjx-container, svg, .MathJax')) continue;
         const text = n.nodeValue ?? '';
         if (!text) continue;
         const cls = n.parentElement?.className ?? '';
@@ -846,7 +919,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       }
 
       // ── 标题：换掉已有的标题标记 ──
-      const headingLevels: Record<string, number> = { h1: 1, h2: 2, h3: 3 };
+      const headingLevels: Record<string, number> = { h1: 1, h2: 2, h3: 3, h4: 4, h5: 5, h6: 6 };
       if (id in headingLevels) {
         const level = headingLevels[id];
         const { start, end } = lineBoundsAt(value, caret);
@@ -1136,6 +1209,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       toggleSource: () => setSourceMode((v) => !v),
       toggleFocus: () => setFocusMode((v) => !v),
       toggleTypewriter: () => setTypewriterMode((v) => !v),
+      toggleOutline: () => setOutlineOpen((v) => !v),
     }),
     [runCommand],
   );
@@ -1482,6 +1556,13 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         return;
       }
 
+      // ── 大纲侧栏（Ctrl+Shift+O） ──
+      if (k === 'o' && e.shiftKey) {
+        e.preventDefault();
+        setOutlineOpen((v) => !v);
+        return;
+      }
+
       // ── 整篇源码模式（Typora：Ctrl+/） ──
       if (k === '/') {
         e.preventDefault();
@@ -1805,6 +1886,19 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [value]);
 
+  /** 跳到某一行的行首，并把该行滚到视野中间（大纲点击用） */
+  const jumpToLine = useCallback(
+    (li: number) => {
+      const line = lines[li];
+      if (!line) return;
+      setAnchor(null);
+      setCaret(line.start);
+      inputRef.current?.focus();
+      lineEls.current[li]?.scrollIntoView({ block: 'center' });
+    },
+    [lines],
+  );
+
   /**
    * 取某一行的查找命中（转成行内列号），排除当前命中 —— 当前命中由选区高亮表示。
    *
@@ -1848,7 +1942,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   // 这样长段落折行时行号仍与该行首行对齐（行号若单独成一列，折行后整列都会漂）。
   if (sourceMode) {
     return (
-      <div className="rounded-lg border border-border bg-background">
+      <div className={`bg-background ${plain ? '' : 'rounded-lg border border-border'}`}>
         <div className="relative h-[70vh]">
           <pre
             ref={preRef}
@@ -1878,7 +1972,11 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             className="md-src-input absolute inset-0 resize-none overflow-auto bg-transparent py-4 pr-5 font-mono text-[13px] leading-[1.7] text-transparent caret-foreground outline-none"
           />
         </div>
-        <div className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">
+        <div
+          className={`border-t border-border px-4 py-2 text-[11px] text-muted-foreground ${
+            plain ? 'sticky bottom-0 bg-background' : ''
+          }`}
+        >
           源码模式 · 整篇 Markdown　<span className="text-accent">Ctrl+/</span> 返回所见即所得
         </div>
       </div>
@@ -1887,9 +1985,9 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
 
   return (
     <div
-      className={`relative rounded-lg border bg-background transition-colors ${
-        dragging ? 'border-accent' : 'border-border'
-      }`}
+      className={`relative bg-background transition-colors ${
+        plain ? '' : `rounded-lg border ${dragging ? 'border-accent' : 'border-border'}`
+      } ${plain && dragging ? 'bg-accent/[0.04]' : ''}`}
       onMouseDown={() => inputRef.current?.focus()}
       onDragOver={(e) => {
         // 必须 preventDefault，否则浏览器会用默认行为「打开这个文件」
@@ -1908,6 +2006,27 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         void handleDrop(f);
       }}
     >
+      {outlineOpen && (
+        <aside className="fixed top-0 left-0 z-40 h-screen w-60 overflow-y-auto border-r border-border bg-background px-2 py-5">
+          <div className="px-2 pb-2 text-[11px] font-medium text-muted-foreground">大纲</div>
+          {headings.length === 0 ? (
+            <div className="px-2 text-[12px] text-muted-foreground/60">还没有标题</div>
+          ) : (
+            headings.map((h, k) => (
+              <button
+                key={`${h.line}-${k}`}
+                type="button"
+                onClick={() => jumpToLine(h.line)}
+                title={h.text}
+                style={{ paddingLeft: 8 + (h.level - 1) * 12 }}
+                className="block w-full truncate rounded py-1 pr-2 text-left text-[13px] text-foreground/85 hover:bg-foreground/[0.06]"
+              >
+                {h.text || '(空标题)'}
+              </button>
+            ))
+          )}
+        </aside>
+      )}
       {dragging && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-accent/[0.06] text-sm font-semibold text-accent">
           松手即可导入
@@ -1917,7 +2036,13 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         `select-none` 是必须的：选区由编辑器自己画（见 renderSegs 的 bg-accent/25），
         原生选区会和它叠在一起，且原生那份会被任何一次重渲染抹掉。
       */}
-      <div ref={wrapRef} className="relative select-none px-5 py-4 text-base leading-[1.6]">
+      <div ref={wrapRef} className="relative select-none px-[30px] pt-[30px] pb-[100px] text-base leading-[1.6]">
+        {/* 空文档提示：放在行元素之外，不进字符映射表 */}
+        {value === '' && (
+          <div className="pointer-events-none absolute top-[30px] left-[30px] text-muted-foreground/45">
+            开始输入，或按 Ctrl+O 打开文件
+          </div>
+        )}
         {lines.map((l, i) => {
           const isTableRow = l.kind.type === 'tableHead' || l.kind.type === 'tableBody';
           // 表格块的最后一行才补 border-b（表头下面由表体行的 border-t 顶上，不会双线）
@@ -1926,6 +2051,10 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             isTableRow && nextKind !== 'tableBody' && nextKind !== 'tableSep';
           /** 这一行是否处于「编辑态」（判定见 isEditingLine，渲染与列号映射共用它） */
           const editing = isEditingLine(i);
+          /** 块级公式：非编辑态下整块只画一个公式，块内其余行不占高度 */
+          const inMathBlock = l.mathBlockFirst !== undefined;
+          const mathEditing =
+            inMathBlock && caretLine >= (l.mathBlockFirst ?? 0) && caretLine <= (l.mathBlockLast ?? 0);
           /** 选区在本行内的列号范围；null = 本行没有选中内容 */
           const selRange =
             anchor !== null && anchor !== caret
@@ -1942,12 +2071,12 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             onContextMenu={(e) => onContextMenu(e, i)}
             className={`cursor-text transition-opacity duration-200 ${
               focusMode && focusBlock && !focusBlock.has(i) ? 'opacity-25' : ''
-            } ${
+            } ${l.kind.type === 'code' || l.kind.type === 'fence' ? 'md-code-line' : ''} ${
               l.kind.type === 'tableSep'
                 ? 'hidden'
                 : isTableRow
-                  ? `grid border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
-                      l.kind.type === 'tableHead' ? 'bg-secondary/40 font-bold' : ''
+                  ? `md-table-row grid border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
+                      l.kind.type === 'tableHead' ? 'font-bold' : ''
                     }`
                   : (LINE_CLS[l.kind.type] ?? '')
             }`}
@@ -1957,7 +2086,13 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
                 : undefined
             }
           >
-            {l.kind.type === 'blank' ? (
+            {inMathBlock && !mathEditing ? (
+              l.mathBlockFirst === i ? (
+                <div className="md-math-block">
+                  <MathTex tex={l.mathTex ?? ''} display />
+                </div>
+              ) : null
+            ) : l.kind.type === 'blank' ? (
               /* 空行 = 段落间距（Typora 0.8em），不是一整行高 —— 整行高会让每个块之间都多出一条空白 */
               <span className="inline-block h-[0.8em] w-full" />
             ) : l.kind.type === 'fence' ? (
@@ -1995,14 +2130,14 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
                     {l.prefixText}
                   </span>
                 )}
-                {renderSegs(effectiveSegs(i), selRange, caret - l.start, preedit, hitsForLine(i))}
+                {renderSegs(effectiveSegs(i), selRange, caret - l.start, preedit, hitsForLine(i), l.lang)}
               </>
             ) : (
               /* 非编辑行：完全不露语法 —— 没有 `#` / `>` / `**`，只有渲染结果 */
               <>
                 {l.kind.type === 'ul' && <span className="md-list-marker">•</span>}
                 {l.kind.type === 'ol' && <span className="md-list-marker">{l.kind.marker}.</span>}
-                {renderSegs(l.segs, selRange, -1, preedit, hitsForLine(i))}
+                {renderSegs(l.segs, selRange, -1, preedit, hitsForLine(i), l.lang)}
               </>
             )}
           </div>
@@ -2081,7 +2216,11 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         />
       </div>
 
-      <div className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">
+      <div
+        className={`border-t border-border px-4 py-2 text-[11px] text-muted-foreground ${
+          plain ? 'sticky bottom-0 bg-background' : ''
+        }`}
+      >
         下标 <span className="font-mono text-accent">{caret}</span>
         {'　'}
         {caretLine >= 0 ? `第 ${caretLine + 1} 行 / 共 ${lines.length} 行` : '未定位'}
@@ -2160,6 +2299,7 @@ const SEG_CLS: Record<InlineSeg['kind'], string> = {
   strong: 'font-bold',
   em: 'italic',
   code: 'font-mono text-[0.9em] bg-secondary border border-border rounded-[3px] px-1',
+  math: '',
   del: 'line-through opacity-60',
   link: 'text-accent underline underline-offset-2',
   url: 'text-accent underline underline-offset-2',
@@ -2173,6 +2313,18 @@ const SEG_CLS: Record<InlineSeg['kind'], string> = {
  */
 const PREEDIT_CLS = 'md-preedit border-b-2 border-accent text-foreground';
 
+/** 切开后的一个小片 */
+interface SegPiece {
+  kind: InlineSeg['kind'];
+  text: string;
+  /** 行内起始列号 */
+  start: number;
+  /** 所属片段带的地址（图片 / 链接） */
+  href?: string;
+  /** 所属片段的起始列号；用于判断某片是不是该片段的第一片 */
+  segStart: number;
+}
+
 /**
  * 把一行的片段在若干列号处切开。
  *
@@ -2180,25 +2332,77 @@ const PREEDIT_CLS = 'md-preedit border-b-2 border-accent text-foreground';
  *
  * @param segs 该行片段（`srcStart` 已含前缀长度）
  * @param cuts 切开处的行内列号（越界的会被自动忽略）
- * @returns 切好的小片，`start` 是它的行内起始列号
+ * @returns 切好的小片
  */
-function splitSegsAt(
-  segs: InlineSeg[],
-  cuts: number[],
-): { kind: InlineSeg['kind']; text: string; start: number }[] {
+function splitSegsAt(segs: InlineSeg[], cuts: number[]): SegPiece[] {
   const marks = [...new Set(cuts)].sort((a, b) => a - b);
-  const out: { kind: InlineSeg['kind']; text: string; start: number }[] = [];
+  const out: SegPiece[] = [];
   for (const s of segs) {
     const s0 = s.srcStart;
     const s1 = s.srcStart + s.text.length;
     const inner = marks.filter((c) => c > s0 && c < s1);
     let prev = s0;
     for (const c of [...inner, s1]) {
-      out.push({ kind: s.kind, text: s.text.slice(prev - s0, c - s0), start: prev });
+      out.push({ kind: s.kind, text: s.text.slice(prev - s0, c - s0), start: prev, href: s.href, segStart: s0 });
       prev = c;
     }
   }
   return out;
+}
+
+/** 把 Markdown 里的图片地址转成浏览器可加载的 URL */
+function imageSrc(href: string): string {
+  const h = href.trim();
+  if (/^(https?:|data:|blob:)/i.test(h)) return h;
+  // 本地路径交给桌面壳的自定义协议；网页版加载不了，会走破图分支
+  return window.desktop ? `jinmo-file://local/?p=${encodeURIComponent(h)}` : h;
+}
+
+/**
+ * 异步渲染 TeX（MathJax）。
+ *
+ * 渲染完成前先显示原文，避免公式位置跳动；渲染成 SVG 后可见文本消失，
+ * 故补一个隐藏文本占位，字符映射表才能继续按片段消费。
+ *
+ * @param tex TeX 源码
+ * @param display 是否块级
+ */
+function MathTex({ tex, display }: { tex: string; display: boolean }) {
+  const [html, setHtml] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void renderMath(tex, display).then((r) => {
+      if (alive) setHtml(r);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [tex, display]);
+
+  return html ? (
+    <>
+      <span className="md-math" dangerouslySetInnerHTML={{ __html: html }} />
+      <span className="md-ghost" aria-hidden="true">
+        {tex}
+      </span>
+    </>
+  ) : (
+    <span className="md-math-raw">{tex}</span>
+  );
+}
+
+/** 行内图片；加载失败时浏览器会显示 alt，这里只补破图样式 */
+function InlineImage({ href, alt }: { href: string; alt: string }) {
+  const [broken, setBroken] = useState(false);
+  return (
+    <img
+      src={imageSrc(href)}
+      alt={alt}
+      draggable={false}
+      className={broken ? 'md-img-inline md-img-inline-broken' : 'md-img-inline'}
+      onError={() => setBroken(true)}
+    />
+  );
 }
 
 /**
@@ -2211,6 +2415,7 @@ function splitSegsAt(
  * @param caretCol 光标在本行的列号；负数表示光标不在本行
  * @param preedit 预编辑串；空串表示当前没有组合
  * @param hits 查找命中在本行内的列号范围（当前命中不在其中，它由选区高亮表示）
+ * @param codeLang 代码块的语言标识；`undefined` 表示不是代码行（空串表示代码行但未标语言）
  * @returns React 节点数组
  */
 function renderSegs(
@@ -2219,6 +2424,7 @@ function renderSegs(
   caretCol: number,
   preedit: string,
   hits: { start: number; end: number }[] = [],
+  codeLang?: string,
 ): React.ReactNode[] {
   const cuts: number[] = [];
   if (sel) cuts.push(sel.start, sel.end);
@@ -2241,11 +2447,47 @@ function renderSegs(
     }
     const selected = !!sel && p.start >= sel.start && p.start < sel.end;
     const hit = hits.find((h) => p.start >= h.start && p.start < h.end);
-    const base = p.text.startsWith('🖼') ? 'md-img-token' : SEG_CLS[p.kind];
     // 选区优先：命中若与选区重叠就不叠一层黄底（当前命中就是选区）
     const extra = (hit && !selected ? ' bg-find/70' : '') + (selected ? ' bg-accent/25' : '');
+
+    // 代码行：整片交给着色器。文本节点仍由浏览器生成，字符映射表照常按片段消费
+    if (codeLang !== undefined) {
+      out.push(
+        <span
+          key={k}
+          className={`font-mono text-sm${extra}`}
+          dangerouslySetInnerHTML={{ __html: highlightCode(p.text, codeLang) }}
+        />,
+      );
+      return;
+    }
+
+    // 行内公式：渲染成 MathJax 的 SVG
+    if (p.kind === 'math') {
+      out.push(
+        <span key={k} className={`md-math-wrap${extra}`}>
+          <MathTex tex={p.text} display={false} />
+        </span>,
+      );
+      return;
+    }
+
+    // 图片：整段渲染成真图。片段可能被选区切开，只有第一片画图，
+    // 其余片留隐藏文本占位 —— 字符映射表要按片段消费，占位不能省
+    if (p.text.startsWith('🖼')) {
+      out.push(
+        <span key={k} className={`md-img-wrap${extra}`}>
+          {p.start === p.segStart && p.href ? <InlineImage href={p.href} alt={p.text} /> : null}
+          <span className="md-ghost" aria-hidden="true">
+            {p.text}
+          </span>
+        </span>,
+      );
+      return;
+    }
+
     out.push(
-      <span key={k} className={base + extra}>
+      <span key={k} className={SEG_CLS[p.kind] + extra}>
         {p.text}
       </span>,
     );

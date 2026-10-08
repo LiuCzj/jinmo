@@ -15,7 +15,7 @@ export interface InlineSeg {
   /** 含标记符在内的完整源码范围终点（右开） */
   rawEnd: number;
   /** 样式种类 */
-  kind: 'plain' | 'strong' | 'em' | 'code' | 'del' | 'link' | 'url';
+  kind: 'plain' | 'strong' | 'em' | 'code' | 'del' | 'link' | 'url' | 'math';
   /** kind 为 link 时的地址 */
   href?: string;
 }
@@ -55,6 +55,31 @@ export function parseInline(src: string): InlineSeg[] {
         flush();
         segs.push({ text: src.slice(i + 1, end), srcStart: i + 1, rawStart: i, rawEnd: end + 1, kind: 'code' });
         i = end + 1;
+        continue;
+      }
+    }
+
+    // 行内公式 $...$。规则照 Typora 官方文档（接近 Pandoc）：
+    // 开 $ 后不能是空白；闭 $ 前不能是空白、前一字符不能是反斜杠、后不能紧跟数字（`$2` 保持文本）
+    if (src[i] === '$' && src[i + 1] !== undefined && src[i + 1] !== '$' && !/\s/.test(src[i + 1])) {
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === '$' && src[j - 1] !== '\\' && !/\s/.test(src[j - 1])) {
+          const after = src[j + 1];
+          if (after === undefined || !/\d/.test(after)) break;
+        }
+        j++;
+      }
+      if (j < src.length) {
+        flush();
+        segs.push({
+          text: src.slice(i + 1, j),
+          srcStart: i + 1,
+          rawStart: i,
+          rawEnd: j + 1,
+          kind: 'math',
+        });
+        i = j + 1;
         continue;
       }
     }
