@@ -83,6 +83,10 @@ const recentFile = () => path.join(app.getPath('userData'), 'recent-files.json')
 
 /** @type {BrowserWindow | null} */
 let win = null;
+/** 渲染进程报上来的「有未保存改动」 */
+let dirty = false;
+/** 关闭流程已确认，允许真正关窗 */
+let allowClose = false;
 
 function readJson(file, fallback) {
   try {
@@ -288,6 +292,32 @@ function createWindow() {
   win.on('maximize', saveWindowState);
   win.on('unmaximize', saveWindowState);
   win.on('close', saveWindowState);
+  win.on('close', async (e) => {
+    if (allowClose) return;
+    e.preventDefault();
+    if (!dirty) {
+      allowClose = true;
+      win?.close();
+      return;
+    }
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'warning',
+      buttons: ['保存并退出', '直接退出', '取消'],
+      defaultId: 0,
+      cancelId: 2,
+      message: '文档有未保存的修改',
+      detail: '关闭前要保存吗？',
+    });
+    if (response === 2) return;
+    if (response === 0) {
+      // 交给渲染进程保存；等它把 dirty 清掉（最多 3 秒）
+      win?.webContents.send('menu', 'save');
+      for (let i = 0; i < 30 && dirty; i++) await new Promise((r) => setTimeout(r, 100));
+      if (dirty) return; // 保存失败或用户取消了另存为 → 不关
+    }
+    allowClose = true;
+    win?.close();
+  });
   win.on('closed', () => {
     win = null;
   });
@@ -379,6 +409,10 @@ ipcMain.handle('file:clear-recent', () => {
   return [];
 });
 ipcMain.handle('title:set', (_e, title) => win?.setTitle(title));
+// 渲染进程上报是否有未保存改动，关窗前用它决定要不要提示
+ipcMain.on('dirty:set', (_e, v) => {
+  dirty = Boolean(v);
+});
 
 // ── 生命周期 ──────────────────────────────────────────────
 

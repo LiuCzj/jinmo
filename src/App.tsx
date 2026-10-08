@@ -136,6 +136,11 @@ export default function App() {
     void desktop.setTitle(`${dirty ? '● ' : ''}${name} — jinmo`);
   }, [desktop, dirty, filePath]);
 
+  // 把未保存状态同步给桌面壳，关窗前它会据此提示
+  useEffect(() => {
+    desktop?.setDirty(dirty);
+  }, [desktop, dirty]);
+
   return (
     <div className="min-h-screen">
       {/* 版心宽度与内边距照 github.css 的 `#write`：860px 内容宽 + 30px 内边距 */}

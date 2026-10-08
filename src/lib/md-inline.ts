@@ -15,12 +15,53 @@ export interface InlineSeg {
   /** 含标记符在内的完整源码范围终点（右开） */
   rawEnd: number;
   /** 样式种类 */
-  kind: 'plain' | 'strong' | 'em' | 'code' | 'del' | 'link' | 'url' | 'math' | 'strongem' | 'fnref' | 'task';
+  kind:
+    | 'plain'
+    | 'strong'
+    | 'em'
+    | 'code'
+    | 'del'
+    | 'link'
+    | 'url'
+    | 'math'
+    | 'strongem'
+    | 'fnref'
+    | 'task'
+    | 'html'
+    | 'htmlvoid'
+    | 'hl';
   /** kind 为 link 时的地址 */
   href?: string;
   /** kind 为 task 时是否已勾选 */
   checked?: boolean;
+  /** kind 为 html / htmlvoid 时的标签名 */
+  htmlTag?: string;
 }
+
+/** 允许渲染的行内 HTML 标签白名单；不在表内的当普通文本，避免注入 */
+const HTML_TAGS = [
+  'u',
+  'sub',
+  'sup',
+  'kbd',
+  'mark',
+  'b',
+  'i',
+  'em',
+  'strong',
+  's',
+  'del',
+  'ins',
+  'small',
+  'abbr',
+  'cite',
+  'q',
+  'var',
+  'samp',
+];
+
+/** 允许渲染的单个标签（无内容），如 `<br>` */
+const HTML_VOID = ['br'];
 
 /**
  * 把一行源码切成可见片段。
@@ -83,6 +124,43 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
           kind: 'fnref',
         });
         i = end + 1;
+        continue;
+      }
+    }
+
+    // 行内 HTML。只渲染白名单里的标签，其余当普通文本（不做注入）
+    if (src[i] === '<') {
+      const open = /^<([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>/.exec(src.slice(i));
+      if (open && HTML_TAGS.includes(open[1].toLowerCase())) {
+        const tag = open[1].toLowerCase();
+        const innerStart = i + open[0].length;
+        const close = src.indexOf(`</${tag}>`, innerStart);
+        if (close !== -1) {
+          flush();
+          segs.push({
+            text: src.slice(innerStart, close),
+            srcStart: innerStart,
+            rawStart: i,
+            rawEnd: close + tag.length + 3,
+            kind: 'html',
+            htmlTag: tag,
+          });
+          i = close + tag.length + 3;
+          continue;
+        }
+      }
+      const voidTag = /^<([a-zA-Z][a-zA-Z0-9]*)\s*\/?>/.exec(src.slice(i));
+      if (voidTag && HTML_VOID.includes(voidTag[1].toLowerCase())) {
+        flush();
+        segs.push({
+          text: voidTag[0],
+          srcStart: i,
+          rawStart: i,
+          rawEnd: i + voidTag[0].length,
+          kind: 'htmlvoid',
+          htmlTag: voidTag[1].toLowerCase(),
+        });
+        i += voidTag[0].length;
         continue;
       }
     }
@@ -185,6 +263,23 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
           kind: 'strongem',
         });
         i = end + 3;
+        continue;
+      }
+    }
+
+    // 文本高亮 ==x==（扩展语法）
+    if (src.startsWith('==', i)) {
+      const end = src.indexOf('==', i + 2);
+      if (end !== -1) {
+        flush();
+        segs.push({
+          text: src.slice(i + 2, end),
+          srcStart: i + 2,
+          rawStart: i,
+          rawEnd: end + 2,
+          kind: 'hl',
+        });
+        i = end + 2;
         continue;
       }
     }

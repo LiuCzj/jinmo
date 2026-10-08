@@ -214,6 +214,16 @@
     background-color: hsl(0 0% 97%);
   }
 
+  /*
+   * ── 视口渲染 ──────────────────────────────────────────────
+   * 视口外的行让浏览器直接跳过布局与绘制（长文档下这是最省事、收益最大的一刀）。
+   * `contain-intrinsic-size: auto 32px` 让浏览器记住每行真实高度、滚动条长度保持稳定。
+   */
+  .md-line {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 32px;
+  }
+
   /* ── 任务列表与脚注 ── */
   .md-task {
     display: inline-flex;

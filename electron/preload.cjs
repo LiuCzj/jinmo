@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld('desktop', {
   /** 设置窗口标题 */
   setTitle: (title) => ipcRenderer.invoke('title:set', title),
 
+  /** 上报「有未保存改动」，关窗前据此决定要不要提示 */
+  setDirty: (v) => ipcRenderer.send('dirty:set', Boolean(v)),
+
   /**
    * 订阅「菜单或最近文件打开了某个文件」。
    * @param cb 回调，参数为 { path, content }

@@ -386,6 +386,50 @@ it('parseInline: 脚注引用 [^1] → kind=fnref，可见文字是脚注 id', (
   );
 });
 
+console.log('\n[新增] 行内 HTML');
+
+it('parseInline: 白名单内的行内 HTML 单独成片段', () => {
+  const segs = inline.parseInline('a <u>下划线</u> b');
+  assert.deepStrictEqual(
+    segs.map((s) => [s.text, s.kind, s.htmlTag, s.srcStart, s.rawStart, s.rawEnd]),
+    [
+      ['a ', 'plain', undefined, 0, 0, 2],
+      ['下划线', 'html', 'u', 5, 2, 12],
+      [' b', 'plain', undefined, 12, 12, 14],
+    ],
+  );
+});
+
+it('parseInline: 白名单外的标签当普通文本（不做注入）', () => {
+  const segs = inline.parseInline('<script>x</script>');
+  assert.ok(!segs.some((s) => s.kind === 'html'));
+});
+
+it('parseInline: <br> 识别为无内容标签', () => {
+  const segs = inline.parseInline('a<br>b');
+  const v = segs.find((s) => s.kind === 'htmlvoid');
+  assert.ok(v && v.htmlTag === 'br' && v.text === '<br>');
+});
+
+console.log('\n[新增] 文本高亮');
+
+it('parseInline: ==x== 单独成片段', () => {
+  const segs = inline.parseInline('a ==重点== b');
+  assert.deepStrictEqual(
+    segs.map((s) => [s.text, s.kind, s.srcStart, s.rawStart, s.rawEnd]),
+    [
+      ['a ', 'plain', 0, 0, 2],
+      ['重点', 'hl', 4, 2, 8],
+      [' b', 'plain', 8, 8, 10],
+    ],
+  );
+});
+
+it('parseInline: 落单的 == 当普通文本', () => {
+  const segs = inline.parseInline('a == b');
+  assert.ok(!segs.some((s) => s.kind === 'hl'));
+});
+
 console.log('\n──────────────────────────────');
 console.log(`结果：${passed} 通过, ${failed} 失败`);
 if (failed > 0) process.exit(1);

@@ -6,7 +6,9 @@
  */
 
 import {
+  createElement,
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -158,8 +160,22 @@ function sliceSegs(segs: InlineSeg[], from: number, to: number): InlineSeg[] {
   return out;
 }
 
+/** 上一轮 buildLines 的结果，用于复用没变的行对象 */
+let prevLines: RenderLine[] = [];
+let prevDefsKey = '';
+
+/**
+ * 没有查找命中时的空数组。
+ *
+ * 必须是**同一个引用**：行组件是记忆化的，每次返回新 `[]` 会让所有行都判定为"变了"而重渲染。
+ */
+const NO_HITS: FindHit[] = [];
+
 /**
  * 把整篇切成一行的渲染描述。
+ *
+ * 内容与起始位置都没变的行**复用上一轮的对象**：行组件是记忆化的，
+ * 对象引用不变它就跳过重渲染 —— 这是长文档下敲字跟手的关键。
  *
  * @param src 整篇 Markdown
  * @returns 逐行的渲染描述
@@ -278,7 +294,35 @@ function buildLines(src: string): RenderLine[] {
     }
   }
 
-  return out;
+  // 复用没变的行对象（见函数注释）。引用定义变了就不复用，避免拿到过期的链接解析结果
+  const defsKey = JSON.stringify(defs);
+  const merged =
+    defsKey === prevDefsKey
+      ? out.map((l, i) => {
+          const p = prevLines[i];
+          if (!p || p.src !== l.src || p.start !== l.start) return l;
+          if (
+            p.kind.type !== l.kind.type ||
+            p.kind.prefixLen !== l.kind.prefixLen ||
+            p.kind.marker !== l.kind.marker
+          ) {
+            return l;
+          }
+          if (
+            p.lang !== l.lang ||
+            p.mathTex !== l.mathTex ||
+            p.mathBlockFirst !== l.mathBlockFirst ||
+            p.mathBlockLast !== l.mathBlockLast
+          ) {
+            return l;
+          }
+          return p;
+        })
+      : out;
+  prevLines = merged;
+  prevDefsKey = defsKey;
+
+  return merged;
 }
 
   /**
@@ -472,7 +516,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   const [findIndex, setFindIndex] = useState(-1);
   /** 全文命中（随查找串 / 大小写 / 正文变化重算） */
   const findHits = useMemo<FindHit[]>(
-    () => (find && find.query ? findAll(value, find.query, find.caseSensitive) : []),
+    () => (find && find.query ? findAll(value, find.query, find.caseSensitive) : NO_HITS),
     [find, value],
   );
 
@@ -517,12 +561,32 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
        * 若 col 已越过后半行，则画在「源码下标 < col 的最后一个可见字符」的右边缘。
        */
       const head = map.find((c) => c.src !== null && c.src >= col);
-      if (head) {
+      const prev = [...map].reverse().find((c) => c.src !== null && c.src < col);
+      const cellOf = (e?: CharMapEntry) => e?.node.parentElement?.closest('[data-cell]') ?? null;
+      /**
+       * 表格里格尾的 `|` 不渲染：光标停在格尾时，「src ≥ col 的第一个可见字符」会是**下一格**的首字，
+       * 直接按它画就会把光标画到隔壁格去。这种情况改贴本格最后一个字符的右边缘。
+       *
+       * ⚠️ 必须排除「有字符的列号正好等于 col」——那是光标正落在某格首字符上，属于正常情况，
+       * 不加这个条件就会把光标从第 2 格错误地拉回第 1 格。
+       */
+      const jumped =
+        !!head && !!prev && head.src !== col && cellOf(prev) !== null && cellOf(head) !== cellOf(prev);
+      if (head && !jumped) {
         const r = document.createRange();
         r.setStart(head.node, head.offset);
         r.setEnd(head.node, head.offset + 1);
         const rr = r.getBoundingClientRect();
         if (rr.width || rr.height) return { x: rr.left - wr.left, y: rr.top - wr.top, h: rr.height };
+      }
+
+      // 光标其实在本格末尾：贴本格最后一个可见字符的右边缘
+      if (jumped && prev) {
+        const r = document.createRange();
+        r.setStart(prev.node, prev.offset);
+        r.setEnd(prev.node, prev.offset + 1);
+        const rr = r.getBoundingClientRect();
+        if (rr.width || rr.height) return { x: rr.right - wr.left, y: rr.top - wr.top, h: rr.height };
       }
 
       // 行尾：量最后一个有源码映射的字符，取右边缘
@@ -1342,6 +1406,22 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           }
         }
       }
+
+      // 表格：光标必须落在「被点的那一格」的源码范围内。
+      // 格与格之间的 `|` 不渲染，不钳住就会算到隔壁格去（看着在第一格、打字却进第二格）
+      if (line.kind.type === 'tableHead' || line.kind.type === 'tableBody') {
+        const el = lineEls.current[li];
+        const cells = el ? [...el.children] : [];
+        const hitIdx = cells.findIndex((c) => {
+          const r = c.getBoundingClientRect();
+          return clientX >= r.left && clientX <= r.right;
+        });
+        const range = hitIdx === -1 ? undefined : tableCellRanges(line.src)[hitIdx];
+        if (range) {
+          next = Math.max(line.start + range.from, Math.min(next, line.start + range.to));
+        }
+      }
+
       return Math.max(line.start, Math.min(next, line.start + line.src.length));
     },
     [caret, lines],
@@ -1931,6 +2011,24 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     [applyEdit, lines, value],
   );
 
+  /**
+   * 编辑区空白处按下：光标落到文末；末尾不是空行就先补一行。
+   *
+   * 点在行上时不插手 —— 那种情况交给行自己的处理函数（按坐标反查落点）。
+   */
+  const onBackgroundMouseDown = (e: React.MouseEvent) => {
+    inputRef.current?.focus();
+    if ((e.target as HTMLElement).closest('.cursor-text')) return;
+    e.preventDefault();
+    if (value === '') return;
+    if (value.endsWith('\n')) {
+      setAnchor(null);
+      setCaret(value.length);
+    } else {
+      applyEdit({ text: value + '\n', caret: value.length + 1 });
+    }
+  };
+
   /** 跳到某一行的行首，并把该行滚到视野中间（大纲点击用） */
   const jumpToLine = useCallback(
     (li: number) => {
@@ -1979,6 +2077,38 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     pre.scrollTop = ta.scrollTop;
     pre.scrollLeft = ta.scrollLeft;
   };
+
+  /** 行元素引用登记。必须是稳定引用，否则记忆化的行组件每次都会重渲染 */
+  const registerLine = useCallback((li: number, el: HTMLDivElement | null) => {
+    lineEls.current[li] = el;
+  }, []);
+
+  /**
+   * 行的鼠标处理函数用 ref 转发。
+   *
+   * 这三个函数每次渲染都会重建，直接传给记忆化的行组件会让记忆化彻底失效。
+   */
+  const lineHandlers = useRef({ onLineClick, onLineMouseDown, onContextMenu });
+  lineHandlers.current = { onLineClick, onLineMouseDown, onContextMenu };
+
+  /**
+   * 传给记忆化行组件的必须是**稳定引用**：只包一层 useCallback([])，
+   * 内部再去读 ref 里的最新实现。直接把 `lineHandlers.current.xxx` 传下去没用 ——
+   * ref 每次渲染都被赋成新函数，引用照样每次都变。
+   */
+  const stableLineClick = useCallback((li: number, e: React.MouseEvent) => {
+    lineHandlers.current.onLineClick(li, e);
+  }, []);
+  const stableLineMouseDown = useCallback((li: number, e: React.MouseEvent) => {
+    lineHandlers.current.onLineMouseDown(li, e);
+  }, []);
+  const stableContextMenu = useCallback((e: React.MouseEvent, li: number) => {
+    lineHandlers.current.onContextMenu(e, li);
+  }, []);
+
+  /** 选区范围在全局算一次，别给每一行重复算 */
+  const selLo = anchor !== null && anchor !== caret ? Math.min(anchor, caret) : null;
+  const selHi = selLo === null ? null : Math.max(anchor ?? 0, caret);
 
   // ── 整篇源码模式：整篇按 Markdown 源码编辑，不做任何渲染 ──
   //
@@ -2031,9 +2161,9 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   return (
     <div
       className={`relative bg-background transition-colors ${
-        plain ? '' : `rounded-lg border ${dragging ? 'border-accent' : 'border-border'}`
+        plain ? 'min-h-screen' : `rounded-lg border ${dragging ? 'border-accent' : 'border-border'}`
       } ${plain && dragging ? 'bg-accent/[0.04]' : ''}`}
-      onMouseDown={() => inputRef.current?.focus()}
+      onMouseDown={onBackgroundMouseDown}
       onDragOver={(e) => {
         // 必须 preventDefault，否则浏览器会用默认行为「打开这个文件」
         if (e.dataTransfer.types.includes('Files')) {
@@ -2088,110 +2218,35 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             开始输入，或按 Ctrl+O 打开文件
           </div>
         )}
-        {lines.map((l, i) => {
-          const isTableRow = l.kind.type === 'tableHead' || l.kind.type === 'tableBody';
-          // 表格块的最后一行才补 border-b（表头下面由表体行的 border-t 顶上，不会双线）
-          const nextKind = lines[i + 1]?.kind.type;
-          const isTableLast =
-            isTableRow && nextKind !== 'tableBody' && nextKind !== 'tableSep';
-          /** 这一行是否处于「编辑态」（判定见 isEditingLine，渲染与列号映射共用它） */
-          const editing = isEditingLine(i);
-          /** 块级公式：非编辑态下整块只画一个公式，块内其余行不占高度 */
-          const inMathBlock = l.mathBlockFirst !== undefined;
-          const mathEditing =
-            inMathBlock && caretLine >= (l.mathBlockFirst ?? 0) && caretLine <= (l.mathBlockLast ?? 0);
-          /** 选区在本行内的列号范围；null = 本行没有选中内容 */
-          const selRange =
-            anchor !== null && anchor !== caret
-              ? { start: Math.min(anchor, caret) - l.start, end: Math.max(anchor, caret) - l.start }
-              : null;
-          return (
-          <div
+        {lines.map((l, i) => (
+          <EditorLine
             key={i}
-            ref={(el) => {
-              lineEls.current[i] = el;
-            }}
-            onClick={(e) => onLineClick(i, e)}
-            onMouseDown={(e) => onLineMouseDown(i, e)}
-            onContextMenu={(e) => onContextMenu(e, i)}
-            className={`cursor-text transition-opacity duration-200 ${
-              focusMode && focusBlock && !focusBlock.has(i) ? 'opacity-25' : ''
-            } ${l.kind.type === 'code' || l.kind.type === 'fence' ? 'md-code-line' : ''} ${
-              l.kind.type === 'tableSep'
-                ? 'hidden'
-                : isTableRow
-                  ? `md-table-row grid border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
-                      l.kind.type === 'tableHead' ? 'font-bold' : ''
-                    }`
-                  : (LINE_CLS[l.kind.type] ?? '')
-            }`}
-            style={
-              isTableRow
-                ? { gridTemplateColumns: `repeat(${l.tableCols ?? 1}, minmax(0, 1fr))` }
-                : undefined
+            line={l}
+            index={i}
+            editing={isEditingLine(i)}
+            mathEditing={
+              l.mathBlockFirst !== undefined &&
+              caretLine >= (l.mathBlockFirst ?? 0) &&
+              caretLine <= (l.mathBlockLast ?? 0)
             }
-          >
-            {inMathBlock && !mathEditing ? (
-              l.mathBlockFirst === i ? (
-                <div className="md-math-block">
-                  <MathTex tex={l.mathTex ?? ''} display />
-                </div>
-              ) : null
-            ) : l.kind.type === 'blank' ? (
-              /* 空行 = 段落间距（Typora 0.8em），不是一整行高 —— 整行高会让每个块之间都多出一条空白 */
-              <span className="inline-block h-[0.8em] w-full" />
-            ) : l.kind.type === 'fence' ? (
-              <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
-            ) : l.kind.type === 'hr' ? (
-              /* 分割线：Typora 渲成一条 2px 灰线（github.css：height 2px / #e7e7e7 / margin 16px 0），
-                 光标停上来时才露出源码 `---` */
-              editing ? (
-                <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
-              ) : (
-                <span className="block h-[2px] w-full bg-border" />
-              )
-            ) : isTableRow ? (
-              /* 表格行：按单元格边界切片段渲染，竖线本身不出现在 DOM 里 */
-              tableCellRanges(l.src).map((r, ci) => (
-                <div
-                  key={ci}
-                  className="border-r border-border px-3 py-1.5 whitespace-pre-wrap last:border-r-0"
-                >
-                  {sliceSegs(l.segs, r.from, r.to).map((p, k) => (
-                    <span key={k} className={p.text.startsWith('🖼') ? 'md-img-token' : SEG_CLS[p.kind]}>
-                      {p.text}
-                    </span>
-                  ))}
-                </div>
-              ))
-            ) : editing ? (
-              /* 编辑态：露出块前缀（`## ` / `> ` / `- `），并把光标所在的那个行内元素按源码原样显示 */
-              <>
-                {l.prefixText !== '' && (
-                  /* 标题的 `#` 比标题正文小一号（Typora 的做法），否则一大串 `######` 会喧宾夺主 */
-                  <span
-                    className={`text-muted-foreground/40 ${l.kind.type.startsWith('h') ? 'text-[0.6em]' : ''}`}
-                  >
-                    {l.prefixText}
-                  </span>
-                )}
-                {renderSegs(effectiveSegs(i), selRange, caret - l.start, preedit, hitsForLine(i), l.lang, (col) => toggleTaskAt(i, col))}
-              </>
-            ) : (
-              /* 非编辑行：完全不露语法 —— 没有 `#` / `>` / `**`，只有渲染结果 */
-              <>
-                {/* 任务项只画复选框，不再画圆点 */}
-                {l.kind.type === 'ul' && l.segs[0]?.kind !== 'task' && (
-                  <span className="md-list-marker">•</span>
-                )}
-                {l.kind.type === 'ol' && <span className="md-list-marker">{l.kind.marker}.</span>}
-                {renderSegs(l.segs, selRange, -1, preedit, hitsForLine(i), l.lang, (col) => toggleTaskAt(i, col))}
-              </>
-            )}
-          </div>
-          );
-        })}
-
+            dimmed={!!(focusMode && focusBlock && !focusBlock.has(i))}
+            isTableLast={
+              (l.kind.type === 'tableHead' || l.kind.type === 'tableBody') &&
+              lines[i + 1]?.kind.type !== 'tableBody' &&
+              lines[i + 1]?.kind.type !== 'tableSep'
+            }
+            selStart={selLo === null ? 0 : selLo - l.start}
+            selEnd={selHi === null ? 0 : selHi - l.start}
+            caretCol={i === caretLine ? caret - l.start : -1}
+            preedit={i === caretLine ? preedit : ''}
+            hits={findHits}
+            onLineClick={stableLineClick}
+            onLineMouseDown={stableLineMouseDown}
+            onContextMenu={stableContextMenu}
+            onToggleTask={toggleTaskAt}
+            registerLine={registerLine}
+          />
+        ))}
         {caretBox && (
           <div
             className={`pointer-events-none absolute w-[2px] bg-accent ${
@@ -2351,6 +2406,9 @@ const SEG_CLS: Record<InlineSeg['kind'], string> = {
   strongem: 'font-bold italic',
   fnref: 'md-fnref',
   task: '',
+  html: '',
+  htmlvoid: '',
+  hl: 'md-hl-hl',
   del: 'line-through opacity-60',
   link: 'text-accent underline underline-offset-2',
   url: 'text-accent underline underline-offset-2',
@@ -2374,6 +2432,8 @@ interface SegPiece {
   href?: string;
   /** 任务项是否已勾选 */
   checked?: boolean;
+  /** 行内 HTML 的标签名 */
+  htmlTag?: string;
   /** 所属片段的起始列号；用于判断某片是不是该片段的第一片 */
   segStart: number;
 }
@@ -2402,6 +2462,7 @@ function splitSegsAt(segs: InlineSeg[], cuts: number[]): SegPiece[] {
         start: prev,
         href: s.href,
         checked: s.checked,
+        htmlTag: s.htmlTag,
         segStart: s0,
       });
       prev = c;
@@ -2464,6 +2525,144 @@ function InlineImage({ href, alt }: { href: string; alt: string }) {
     />
   );
 }
+
+/**
+ * 一行要渲染的内容。
+ *
+ * **记忆化**：长文档下每次移动光标都会重渲染整个组件，若不把行隔离出来，
+ * 几千行时每次点击都要重建全部行元素，光标跟不 hands。这里所有 props 都是
+ * 基本类型或稳定引用，行内容没变就不会重渲染。
+ */
+const EditorLine = memo(function EditorLine({
+  line: l,
+  index: i,
+  editing,
+  mathEditing,
+  dimmed,
+  isTableLast,
+  selStart,
+  selEnd,
+  caretCol,
+  preedit,
+  hits,
+  onLineClick,
+  onLineMouseDown,
+  onContextMenu,
+  onToggleTask,
+  registerLine,
+}: {
+  line: RenderLine;
+  index: number;
+  editing: boolean;
+  mathEditing: boolean;
+  /** 专注模式下这一行是否变淡 */
+  dimmed: boolean;
+  /** 表格块的最后一行（补下边框，避免与下一行双线） */
+  isTableLast: boolean;
+  /** 选区在本行内的列号范围；`selStart >= selEnd` 表示本行没被选中 */
+  selStart: number;
+  selEnd: number;
+  /** 光标在本行内的列号；-1 = 光标不在本行 */
+  caretCol: number;
+  preedit: string;
+  /** 全文查找命中；本行内的命中在这里自己筛 */
+  hits: FindHit[];
+  onLineClick: (li: number, e: React.MouseEvent) => void;
+  onLineMouseDown: (li: number, e: React.MouseEvent) => void;
+  onContextMenu: (e: React.MouseEvent, li: number) => void;
+  onToggleTask: (li: number, col: number) => void;
+  registerLine: (li: number, el: HTMLDivElement | null) => void;
+}) {
+  const isTableRow = l.kind.type === 'tableHead' || l.kind.type === 'tableBody';
+  const selRange = selStart < selEnd ? { start: selStart, end: selEnd } : null;
+  const lineEnd = l.start + l.src.length;
+  const lineHits = hits
+    .filter((h) => h.start < lineEnd && h.end > l.start)
+    .map((h) => ({ start: Math.max(h.start, l.start) - l.start, end: Math.min(h.end, lineEnd) - l.start }));
+  const toggle = (col: number) => onToggleTask(i, col);
+
+  return (
+    <div
+      ref={(el) => registerLine(i, el)}
+      onClick={(e) => onLineClick(i, e)}
+      onMouseDown={(e) => onLineMouseDown(i, e)}
+      onContextMenu={(e) => onContextMenu(e, i)}
+      className={`md-line cursor-text transition-opacity duration-200 ${dimmed ? 'opacity-25' : ''} ${
+        l.kind.type === 'code' || l.kind.type === 'fence' ? 'md-code-line' : ''
+      } ${
+        l.kind.type === 'tableSep'
+          ? 'hidden'
+          : isTableRow
+            ? `md-table-row grid border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
+                l.kind.type === 'tableHead' ? 'font-bold' : ''
+              }`
+            : (LINE_CLS[l.kind.type] ?? '')
+      }`}
+      style={
+        isTableRow ? { gridTemplateColumns: `repeat(${l.tableCols ?? 1}, minmax(0, 1fr))` } : undefined
+      }
+    >
+      {l.mathBlockFirst !== undefined && !mathEditing ? (
+        l.mathBlockFirst === i ? (
+          <div className="md-math-block">
+            <MathTex tex={l.mathTex ?? ''} display />
+          </div>
+        ) : null
+      ) : l.kind.type === 'blank' ? (
+        /* 空行 = 段落间距（Typora 0.8em），不是一整行高 —— 整行高会让每个块之间都多出一条空白 */
+        <span className="inline-block h-[0.8em] w-full" />
+      ) : l.kind.type === 'fence' ? (
+        <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
+      ) : l.kind.type === 'hr' ? (
+        /* 分割线：Typora 渲成一条 2px 灰线（github.css：height 2px / #e7e7e7 / margin 16px 0），
+           光标停上来时才露出源码 `---` */
+        editing ? (
+          <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
+        ) : (
+          <span className="block h-[2px] w-full bg-border" />
+        )
+      ) : isTableRow ? (
+        /* 表格行：按单元格边界切片段渲染，竖线本身不出现在 DOM 里 */
+        tableCellRanges(l.src).map((r, ci) => (
+          <div
+            key={ci}
+            data-cell=""
+            className="border-r border-border px-3 py-1.5 whitespace-pre-wrap last:border-r-0"
+          >
+            {sliceSegs(l.segs, r.from, r.to).map((p, k) => (
+              <span key={k} className={p.text.startsWith('🖼') ? 'md-img-token' : SEG_CLS[p.kind]}>
+                {p.text}
+              </span>
+            ))}
+          </div>
+        ))
+      ) : editing ? (
+        /* 编辑态：露出块前缀（`## ` / `> ` / `- `），并把光标所在的那个行内元素按源码原样显示 */
+        <>
+          {l.prefixText !== '' && (
+            /* 标题的 `#` 比标题正文小一号（Typora 的做法），否则一大串 `######` 会喧宾夺主 */
+            <span
+              className={`text-muted-foreground/40 ${l.kind.type.startsWith('h') ? 'text-[0.6em]' : ''}`}
+            >
+              {l.prefixText}
+            </span>
+          )}
+          {renderSegs(revealSegAt(l.segs, l.src, caretCol), selRange, caretCol, preedit, lineHits, l.lang, toggle)}
+        </>
+      ) : (
+        /* 非编辑行：完全不露语法 —— 没有 `#` / `>` / `**`，只有渲染结果 */
+        <>
+          {/* 任务项只画复选框，不再画圆点 */}
+          {l.kind.type === 'ul' && l.segs[0]?.kind !== 'task' && (
+            <span className="md-list-marker">•</span>
+          )}
+          {l.kind.type === 'ol' && <span className="md-list-marker">{l.kind.marker}.</span>}
+          {renderSegs(l.segs, selRange, -1, preedit, lineHits, l.lang, toggle)}
+        </>
+      )}
+    </div>
+  );
+});
 
 /**
  * 渲染一行的可见片段：切出选区高亮、查找命中高亮，并把输入法预编辑串内联插在光标处。
@@ -2539,6 +2738,25 @@ function renderSegs(
               onToggleTask?.(p.segStart);
             }}
           />
+          <span className="md-ghost" aria-hidden="true">
+            {p.text}
+          </span>
+        </span>,
+      );
+      return;
+    }
+
+    // 行内 HTML：白名单标签按元素渲染。可见文字就是标签内容，字符映射表照常
+    if (p.kind === 'html') {
+      out.push(createElement(p.htmlTag ?? 'span', { key: k, className: extra || undefined }, p.text));
+      return;
+    }
+
+    // 无内容标签（`<br>`）：元素本身不产生可见字符，用隐藏占位保住映射
+    if (p.kind === 'htmlvoid') {
+      out.push(
+        <span key={k} className={extra}>
+          {createElement(p.htmlTag ?? 'br')}
           <span className="md-ghost" aria-hidden="true">
             {p.text}
           </span>
