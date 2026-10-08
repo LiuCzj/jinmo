@@ -1,0 +1,254 @@
+/**
+ * 全局样式与设计令牌。
+ *
+ * `@theme` 中的 `--color-*` 会自动生成 `bg-* / text-* / border-*` 工具类并支持透明度修饰符。
+ * 组件依赖这些令牌，缺少定义会导致元素透明或无边框。
+ */
+
+@import 'tailwindcss';
+
+@theme {
+  --color-background: hsl(0 0% 100%);
+  --color-foreground: hsl(222 47% 11%);
+  --color-card: hsl(0 0% 100%);
+  --color-card-hover: hsl(210 40% 98%);
+  --color-border: hsl(214 32% 91%);
+  --color-input: hsl(214 32% 91%);
+  --color-ring: hsl(221 83% 53%);
+  --color-secondary: hsl(210 40% 96%);
+  --color-muted: hsl(210 40% 96%);
+  --color-muted-foreground: hsl(215 16% 47%);
+  --color-accent: hsl(221 83% 53%);
+  --color-accent-foreground: hsl(0 0% 100%);
+  --color-destructive: hsl(0 84% 60%);
+  --color-warm: hsl(25 95% 53%);
+  --color-brand: hsl(262 83% 58%);
+  /* 查找命中高亮（非当前命中用 bg-find/70；当前命中由选区高亮显示） */
+  --color-find: hsl(45 96% 62%);
+}
+
+:root {
+  /* 供组件类里做透明度/阴影用的原始量 */
+  --shadow-tint: 222 47% 11%;
+  --shadow-1: 0.05;
+  --shadow-2: 0.08;
+  --card-hi: 0.6;
+  --radius-card: 0.75rem;
+  --dur-1: 160ms;
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --tint-sky: 199 89% 60%;
+  --tint-violet: 262 83% 58%;
+  --tint-teal: 173 80% 40%;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC',
+      'Hiragino Sans GB', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+@layer components {
+  /* 动作按钮：无边框圆角胶囊 + 极淡底色，最小高度 44px 为触控目标下限 */
+  .btn-soft,
+  .btn-danger,
+  .btn-primary {
+    display: inline-flex;
+    min-height: 44px;
+    flex-shrink: 0;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    border: 0;
+    border-radius: 999px;
+    padding: 0 0.875rem;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    transition:
+      background-color var(--dur-1) var(--ease-out-soft),
+      color var(--dur-1) var(--ease-out-soft);
+  }
+
+  .btn-soft {
+    background-color: color-mix(in srgb, var(--color-foreground) 6%, transparent);
+    color: color-mix(in srgb, var(--color-foreground) 75%, transparent);
+  }
+
+  .btn-soft:hover {
+    background-color: color-mix(in srgb, var(--color-foreground) 12%, transparent);
+    color: var(--color-foreground);
+  }
+
+  .btn-soft:hover svg {
+    color: var(--color-accent);
+  }
+
+  .btn-danger {
+    background-color: color-mix(in srgb, var(--color-destructive) 10%, transparent);
+    color: var(--color-destructive);
+  }
+
+  .btn-danger:hover {
+    background-color: color-mix(in srgb, var(--color-destructive) 18%, transparent);
+  }
+
+  .btn-primary {
+    background-color: var(--color-accent);
+    color: var(--color-accent-foreground);
+  }
+
+  .btn-primary:hover {
+    background-color: color-mix(in srgb, var(--color-accent) 88%, transparent);
+  }
+
+  .btn-icon {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    flex-shrink: 0;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 999px;
+    background-color: transparent;
+    color: var(--color-muted-foreground);
+    transition:
+      background-color var(--dur-1) var(--ease-out-soft),
+      color var(--dur-1) var(--ease-out-soft);
+  }
+
+  .btn-icon:hover {
+    background-color: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+    color: var(--color-foreground);
+  }
+
+  .btn-icon-danger {
+    color: var(--color-destructive);
+  }
+
+  .btn-icon-danger:hover {
+    background-color: color-mix(in srgb, var(--color-destructive) 12%, transparent);
+    color: var(--color-destructive);
+  }
+
+  .btn-soft:disabled,
+  .btn-danger:disabled,
+  .btn-primary:disabled,
+  .btn-icon:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  /* 列表圆点与序号：定宽右对齐，配合行上的 padding-left: 30px; text-indent: -1.2em */
+  .md-list-marker {
+    display: inline-block;
+    width: 1.2em;
+    padding-right: 0.5em;
+    text-align: right;
+    color: var(--color-muted-foreground);
+  }
+
+  /* ── 源码模式：着色层与输入层必须共用同一套字体度量与内边距 ── */
+  .md-src-pre,
+  .md-src-input {
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  .md-src-pre {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .md-src-input {
+    /* 与 .md-src-line 的左内边距相加后，正文起点须与着色层一致 */
+    padding-left: calc(20px + 3.2rem);
+  }
+
+  .md-src-line {
+    position: relative;
+    padding-left: 3.2rem;
+  }
+
+  .md-src-line::before {
+    content: attr(data-n);
+    position: absolute;
+    left: 0;
+    width: 2.6rem;
+    text-align: right;
+    color: var(--color-muted-foreground);
+    opacity: 0.55;
+    user-select: none;
+  }
+
+  /* ── 源码模式着色 ── */
+  .md-hl-mark { color: hsl(215 16% 62%); }
+  .md-hl-h { color: hsl(221 83% 48%); font-weight: 600; }
+  .md-hl-quote { color: hsl(215 16% 47%); }
+  .md-hl-code { color: hsl(25 95% 42%); }
+  .md-hl-fence { color: hsl(215 16% 62%); }
+  .md-hl-hr { color: hsl(215 16% 62%); }
+  .md-hl-strong { color: hsl(222 47% 20%); font-weight: 700; }
+  .md-hl-em { color: hsl(222 47% 25%); font-style: italic; }
+  .md-hl-del { color: hsl(215 16% 47%); text-decoration: line-through; }
+  .md-hl-hl { background: hsl(45 96% 78%); border-radius: 2px; }
+  .md-hl-link { color: hsl(221 83% 53%); text-decoration: underline; }
+  .md-hl-img { color: hsl(330 65% 52%); }
+  .md-hl-url { color: hsl(199 89% 40%); }
+
+  /* ── 图片占位徽章（编辑器里 `![alt](url)` 的可见形态） ── */
+  .md-img-token {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-border);
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--color-secondary) 50%, transparent);
+    padding: 0 0.375rem;
+    font-size: 0.85em;
+    color: var(--color-muted-foreground);
+  }
+
+  .md-img-broken {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    border: 1px dashed var(--color-border);
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--color-secondary) 40%, transparent);
+    padding: 0.6rem 0.8rem;
+    font-size: 0.85rem;
+    color: var(--color-muted-foreground);
+  }
+
+  .md-img-broken-label {
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .md-img-broken-path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78em;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+}
