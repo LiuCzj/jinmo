@@ -214,6 +214,29 @@
     background-color: hsl(0 0% 97%);
   }
 
+  /* ── 任务列表与脚注 ── */
+  .md-task {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 0.35em;
+  }
+
+  .md-task-box {
+    width: 0.95em;
+    height: 0.95em;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--color-accent);
+  }
+
+  /* 脚注引用：上标样式。可见文字就是脚注 id，字符映射表按普通文本处理即可 */
+  .md-fnref {
+    font-size: 0.72em;
+    vertical-align: super;
+    color: var(--color-accent);
+    padding: 0 0.1em;
+  }
+
   /* ── 数学公式（MathJax 输出的 mjx-container） ── */
   .md-math-wrap {
     display: inline-block;

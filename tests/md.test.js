@@ -342,6 +342,50 @@ it('highlightCode: 未知语言不抛错，原文保留', () => {
   assert.ok(html.includes('随便写点什么'));
 });
 
+console.log('\n[新增] 粗斜体 / 转义 / 引用式链接 / 脚注');
+
+it('parseInline: 粗斜体 ***x*** 不被拆成 ** + *x*', () => {
+  const segs = inline.parseInline('***粗斜***');
+  assert.deepStrictEqual(
+    segs.map((s) => [s.text, s.kind, s.srcStart, s.rawStart, s.rawEnd]),
+    [['粗斜', 'strongem', 3, 0, 8]],
+  );
+});
+
+it('parseInline: 转义 \\* 输出字面星号，反斜杠不占可见字符', () => {
+  const segs = inline.parseInline('a \\* b');
+  assert.deepStrictEqual(
+    segs.map((s) => [s.text, s.srcStart, s.rawStart, s.rawEnd]),
+    [
+      ['a ', 0, 0, 2],
+      ['*', 3, 2, 4],
+      [' b', 4, 4, 6],
+    ],
+  );
+});
+
+it('parseInline: 引用式链接用 defs 解析出地址', () => {
+  const segs = inline.parseInline('见 [文档][d1]', { d1: 'https://x' });
+  const link = segs.find((s) => s.kind === 'link');
+  assert.ok(link && link.href === 'https://x' && link.text === '文档');
+});
+
+it('parseInline: 没有对应定义时引用式链接保持原文', () => {
+  const segs = inline.parseInline('见 [文档][nope]');
+  assert.ok(!segs.some((s) => s.kind === 'link'));
+});
+
+it('parseInline: 脚注引用 [^1] → kind=fnref，可见文字是脚注 id', () => {
+  const segs = inline.parseInline('正文[^1]');
+  assert.deepStrictEqual(
+    segs.map((s) => [s.text, s.kind, s.srcStart]),
+    [
+      ['正文', 'plain', 0],
+      ['1', 'fnref', 4],
+    ],
+  );
+});
+
 console.log('\n──────────────────────────────');
 console.log(`结果：${passed} 通过, ${failed} 失败`);
 if (failed > 0) process.exit(1);

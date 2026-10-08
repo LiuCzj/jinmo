@@ -172,6 +172,13 @@ function buildLines(src: string): RenderLine[] {
   /** 当前代码围栏的语言标识 */
   let fenceLang = '';
 
+  // 先收一遍引用式链接的定义行 `[id]: url`（脚注定义 `[^id]:` 不算）
+  const defs: Record<string, string> = {};
+  for (const line of raw) {
+    const m = /^\[([^\]^][^\]]*)\]:\s*(\S+)/.exec(line);
+    if (m) defs[m[1].trim().toLowerCase()] = m[2];
+  }
+
   for (const line of raw) {
     const kind = classifyLine(line, inFence);
     if (kind.type === 'fence') {
@@ -185,7 +192,7 @@ function buildLines(src: string): RenderLine[] {
    * 片段下标需加上前缀长度：parseInline 收到的是去掉前缀的 body，
    * 而光标换算用的是相对整行的列号。
    */
-    const segs =
+    let segs =
       kind.type === 'code'
         ? [
             {
@@ -196,12 +203,36 @@ function buildLines(src: string): RenderLine[] {
               kind: 'plain' as const,
             },
           ]
-        : parseInline(body).map((s) => ({
+        : parseInline(body, defs).map((s) => ({
             ...s,
             srcStart: s.srcStart + kind.prefixLen,
             rawStart: s.rawStart + kind.prefixLen,
             rawEnd: s.rawEnd + kind.prefixLen,
           }));
+
+    // 任务列表：把行首的 `[ ] ` / `[x] ` 单独做成一个复选框片段，其余部分照常解析
+    if (kind.type === 'ul') {
+      const task = /^\[([ xX])\]\s+/.exec(body);
+      if (task) {
+        const shift = kind.prefixLen + task[0].length;
+        segs = [
+          {
+            text: task[0],
+            srcStart: kind.prefixLen,
+            rawStart: kind.prefixLen,
+            rawEnd: shift,
+            kind: 'task',
+            checked: task[1].toLowerCase() === 'x',
+          },
+          ...parseInline(body.slice(task[0].length), defs).map((s) => ({
+            ...s,
+            srcStart: s.srcStart + shift,
+            rawStart: s.rawStart + shift,
+            rawEnd: s.rawEnd + shift,
+          })),
+        ];
+      }
+    }
     out.push({
       start: pos,
       src: line,
@@ -1886,6 +1917,20 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [value]);
 
+  /** 勾选 / 取消某个任务列表项（就地改写源码里的 `[ ]` / `[x]`） */
+  const toggleTaskAt = useCallback(
+    (li: number, col: number) => {
+      const line = lines[li];
+      if (!line) return;
+      const abs = line.start + col;
+      const cur = value.slice(abs, abs + 3);
+      if (!/^\[[ xX]\]$/.test(cur)) return;
+      const next = cur[1] === ' ' ? '[x]' : '[ ]';
+      applyEdit({ text: value.slice(0, abs) + next + value.slice(abs + 3), caret: abs + 3 });
+    },
+    [applyEdit, lines, value],
+  );
+
   /** 跳到某一行的行首，并把该行滚到视野中间（大纲点击用） */
   const jumpToLine = useCallback(
     (li: number) => {
@@ -2130,14 +2175,17 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
                     {l.prefixText}
                   </span>
                 )}
-                {renderSegs(effectiveSegs(i), selRange, caret - l.start, preedit, hitsForLine(i), l.lang)}
+                {renderSegs(effectiveSegs(i), selRange, caret - l.start, preedit, hitsForLine(i), l.lang, (col) => toggleTaskAt(i, col))}
               </>
             ) : (
               /* 非编辑行：完全不露语法 —— 没有 `#` / `>` / `**`，只有渲染结果 */
               <>
-                {l.kind.type === 'ul' && <span className="md-list-marker">•</span>}
+                {/* 任务项只画复选框，不再画圆点 */}
+                {l.kind.type === 'ul' && l.segs[0]?.kind !== 'task' && (
+                  <span className="md-list-marker">•</span>
+                )}
                 {l.kind.type === 'ol' && <span className="md-list-marker">{l.kind.marker}.</span>}
-                {renderSegs(l.segs, selRange, -1, preedit, hitsForLine(i), l.lang)}
+                {renderSegs(l.segs, selRange, -1, preedit, hitsForLine(i), l.lang, (col) => toggleTaskAt(i, col))}
               </>
             )}
           </div>
@@ -2300,6 +2348,9 @@ const SEG_CLS: Record<InlineSeg['kind'], string> = {
   em: 'italic',
   code: 'font-mono text-[0.9em] bg-secondary border border-border rounded-[3px] px-1',
   math: '',
+  strongem: 'font-bold italic',
+  fnref: 'md-fnref',
+  task: '',
   del: 'line-through opacity-60',
   link: 'text-accent underline underline-offset-2',
   url: 'text-accent underline underline-offset-2',
@@ -2321,6 +2372,8 @@ interface SegPiece {
   start: number;
   /** 所属片段带的地址（图片 / 链接） */
   href?: string;
+  /** 任务项是否已勾选 */
+  checked?: boolean;
   /** 所属片段的起始列号；用于判断某片是不是该片段的第一片 */
   segStart: number;
 }
@@ -2343,7 +2396,14 @@ function splitSegsAt(segs: InlineSeg[], cuts: number[]): SegPiece[] {
     const inner = marks.filter((c) => c > s0 && c < s1);
     let prev = s0;
     for (const c of [...inner, s1]) {
-      out.push({ kind: s.kind, text: s.text.slice(prev - s0, c - s0), start: prev, href: s.href, segStart: s0 });
+      out.push({
+        kind: s.kind,
+        text: s.text.slice(prev - s0, c - s0),
+        start: prev,
+        href: s.href,
+        checked: s.checked,
+        segStart: s0,
+      });
       prev = c;
     }
   }
@@ -2416,6 +2476,7 @@ function InlineImage({ href, alt }: { href: string; alt: string }) {
  * @param preedit 预编辑串；空串表示当前没有组合
  * @param hits 查找命中在本行内的列号范围（当前命中不在其中，它由选区高亮表示）
  * @param codeLang 代码块的语言标识；`undefined` 表示不是代码行（空串表示代码行但未标语言）
+ * @param onToggleTask 勾选/取消任务列表项，参数是该行内的列号
  * @returns React 节点数组
  */
 function renderSegs(
@@ -2425,6 +2486,7 @@ function renderSegs(
   preedit: string,
   hits: { start: number; end: number }[] = [],
   codeLang?: string,
+  onToggleTask?: (col: number) => void,
 ): React.ReactNode[] {
   const cuts: number[] = [];
   if (sel) cuts.push(sel.start, sel.end);
@@ -2458,6 +2520,29 @@ function renderSegs(
           className={`font-mono text-sm${extra}`}
           dangerouslySetInnerHTML={{ __html: highlightCode(p.text, codeLang) }}
         />,
+      );
+      return;
+    }
+
+    // 任务列表：复选框 + 隐藏占位（`[ ] ` 本身不显示）
+    if (p.kind === 'task') {
+      out.push(
+        <span key={k} className={`md-task${extra}`}>
+          <input
+            type="checkbox"
+            checked={p.checked}
+            tabIndex={-1}
+            className="md-task-box"
+            onMouseDown={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              e.stopPropagation();
+              onToggleTask?.(p.segStart);
+            }}
+          />
+          <span className="md-ghost" aria-hidden="true">
+            {p.text}
+          </span>
+        </span>,
       );
       return;
     }

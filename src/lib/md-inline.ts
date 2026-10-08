@@ -15,9 +15,11 @@ export interface InlineSeg {
   /** 含标记符在内的完整源码范围终点（右开） */
   rawEnd: number;
   /** 样式种类 */
-  kind: 'plain' | 'strong' | 'em' | 'code' | 'del' | 'link' | 'url' | 'math';
+  kind: 'plain' | 'strong' | 'em' | 'code' | 'del' | 'link' | 'url' | 'math' | 'strongem' | 'fnref' | 'task';
   /** kind 为 link 时的地址 */
   href?: string;
+  /** kind 为 task 时是否已勾选 */
+  checked?: boolean;
 }
 
 /**
@@ -26,9 +28,10 @@ export interface InlineSeg {
  * 无标记的片段满足 `rawStart === srcStart` 且 `rawEnd === srcStart + text.length`。
  *
  * @param src 一行源码，不含换行符
+ * @param defs 引用式链接的定义表（id 小写 → 地址），来自全文的 `[id]: url` 行
  * @returns 可见片段；空行返回空数组
  */
-export function parseInline(src: string): InlineSeg[] {
+export function parseInline(src: string, defs?: Record<string, string>): InlineSeg[] {
   const segs: InlineSeg[] = [];
   let buf = '';
   let bufSrcStart = 0;
@@ -54,6 +57,31 @@ export function parseInline(src: string): InlineSeg[] {
       if (end !== -1) {
         flush();
         segs.push({ text: src.slice(i + 1, end), srcStart: i + 1, rawStart: i, rawEnd: end + 1, kind: 'code' });
+        i = end + 1;
+        continue;
+      }
+    }
+
+    // 转义 `\*` 之类。反斜杠占一列但不产生可见字符，映射指向被转义的那个字符
+    if (src[i] === '\\' && i + 1 < src.length && /[\\`*_{}[\]()#+\-.!>~$|]/.test(src[i + 1])) {
+      flush();
+      segs.push({ text: src[i + 1], srcStart: i + 1, rawStart: i, rawEnd: i + 2, kind: 'plain' });
+      i += 2;
+      continue;
+    }
+
+    // 脚注引用 [^id]
+    if (src[i] === '[' && src[i + 1] === '^') {
+      const end = src.indexOf(']', i + 2);
+      if (end !== -1) {
+        flush();
+        segs.push({
+          text: src.slice(i + 2, end),
+          srcStart: i + 2,
+          rawStart: i,
+          rawEnd: end + 1,
+          kind: 'fnref',
+        });
         i = end + 1;
         continue;
       }
@@ -118,6 +146,46 @@ export function parseInline(src: string): InlineSeg[] {
           i = paren + 1;
           continue;
         }
+      }
+
+      // 引用式链接 [文字][id]；id 留空时用文字本身当 id
+      if (!isImg && close !== -1 && src[close + 1] === '[') {
+        const refEnd = src.indexOf(']', close + 2);
+        if (refEnd !== -1) {
+          const label = src.slice(open + 1, close);
+          const id = src.slice(close + 2, refEnd).trim() || label;
+          const href = defs?.[id.toLowerCase()];
+          if (href !== undefined) {
+            flush();
+            segs.push({
+              text: label,
+              srcStart: open + 1,
+              rawStart: open,
+              rawEnd: refEnd + 1,
+              kind: 'link',
+              href,
+            });
+            i = refEnd + 1;
+            continue;
+          }
+        }
+      }
+    }
+
+    // 粗斜体 ***x***。必须先于 ** 匹配，否则会被拆成 `**` + `*x*`
+    if (src.startsWith('***', i)) {
+      const end = src.indexOf('***', i + 3);
+      if (end !== -1) {
+        flush();
+        segs.push({
+          text: src.slice(i + 3, end),
+          srcStart: i + 3,
+          rawStart: i,
+          rawEnd: end + 3,
+          kind: 'strongem',
+        });
+        i = end + 3;
+        continue;
       }
     }
 
