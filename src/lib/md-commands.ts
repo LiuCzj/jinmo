@@ -12,6 +12,11 @@ export interface EditResult {
   text: string;
   /** 改写后光标应处的位置（相对 text 的绝对下标） */
   caret: number;
+  /**
+   * 改写后应当保持的选区。只在「多行缩进」这类需要保留原选中范围的命令上出现；
+   * 缺省表示按 `caret` 收起选区。
+   */
+  select?: { start: number; end: number };
 }
 
 /** 选区，使用绝对下标 */
@@ -583,6 +588,47 @@ export function tableBlockRange(pos: TablePos): { from: number; to: number } {
   return { from: pos.blockStart, to: pos.lineStarts[last] + pos.lines[last].length };
 }
 
+/**
+ * 表格里按 Tab 时的下一个落点：光标移到下一格内容的开头。
+ *
+ * 末格 → 下一行首格；末行末格 → 不动（返回 null，由调用方决定是否新增一行）。
+ * 分隔行不参与跳转，直接跳过去。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param dir `1` 向后（Tab）；`-1` 向前（Shift+Tab）
+ * @returns 目标光标下标；无可跳之处时 null
+ */
+export function tableTabTarget(text: string, caret: number, dir: 1 | -1 = 1): number | null {
+  const pos = tablePosAt(text, caret);
+  if (!pos) return null;
+
+  const cellCount = Math.max(1, tableCellRanges(pos.lines[0]).length);
+  let row = pos.rowIndex;
+  let col = pos.colIndex + dir;
+
+  // 跨行：行号进一格，列号绕回
+  if (col >= cellCount) {
+    col = 0;
+    row += 1;
+  } else if (col < 0) {
+    col = cellCount - 1;
+    row -= 1;
+  }
+  // 分隔行不落点
+  if (row === 1) row += dir;
+  // 跳出行范围就到底了
+  if (row < 0 || row >= pos.lines.length) return null;
+
+  const ranges = tableCellRanges(pos.lines[row]);
+  const range = ranges[Math.min(col, ranges.length - 1)];
+  if (!range) return null;
+  // 落在格内内容之前（跳过 `| ` 与首尾空白）
+  const inner = pos.lines[row].slice(range.from, range.to);
+  const lead = inner.length - inner.replace(/^\s+/, '').length;
+  return pos.lineStarts[row] + range.from + lead;
+}
+
 /** 表格块所有行用同一套单元格重建后的文本 */
 function rebuildBlock(nextLines: string[]): string {
   return nextLines.join('\n');
@@ -824,6 +870,21 @@ export function getContext(text: string, caret: number): ContextInfo {
 }
 
 /**
+ * 取光标位置应使用的缩进单位串。
+ *
+ * 在代码块里用代码缩进宽度（默认 4 空格），其余位置用正文缩进（2 空格）。
+ * 两者相互独立 —— 正文两空格是 Markdown 惯例，代码四空格是主流语言惯例。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param codeSize 代码块的缩进宽度（空格数）
+ * @returns 缩进单位串
+ */
+export function indentUnitAt(text: string, caret: number, codeSize: number): string {
+  return inCodeFence(text, caret) ? indentUnitOf(codeSize) : INDENT_UNIT;
+}
+
+/**
  * 取光标所在代码块的开围栏 info string（围栏符号之后那一串）。
  *
  * @param text 全文
@@ -859,8 +920,7 @@ function codeFenceInfo(text: string, caret: number): string | null {
 
 /** 右键命中的行内目标（图片 / 链接语法） */
 export interface InlineTarget {
-  /** 图片或链接 */
-  kind: 'image' | 'link';
+  /** 图片或链接 */  kind: 'image' | 'link';
   /** 语法在行内的起始列号（含 `![` 等标记符） */
   start: number;
   /** 语法在行内的结束列号（不含） */
@@ -934,36 +994,113 @@ export function findAll(text: string, query: string, caseSensitive = false): Fin
 
 // ── 缩进 / 标题级别 ────────────────────────────────────────
 
-/** 缩进单位，两个空格 */
+/** 正文缩进单位，两个空格 */
 export const INDENT_UNIT = '  ';
 
+/** 代码块缩进宽度默认值（空格数），与正文缩进相互独立 */
+export const CODE_INDENT_SIZE_DEFAULT = 4;
+
+/** 缩进宽度的合法取值（空格数） */
+export const INDENT_SIZE_CHOICES = [2, 4, 8] as const;
+
 /**
- * 光标所在行的缩进 / 反缩进（Ctrl+[ / Ctrl+]）。
+ * 把缩进宽度（空格数）转成实际的缩进字符串。
  *
- * 缩进：行首加一个缩进单位；反缩进：行首吃掉一个 Tab，或至多一个缩进单位的空格。
+ * @param size 空格数；非正数或非有限值时回退到正文缩进（2 空格）
+ * @returns 由 `size` 个空格组成的串（最小 1 个空格）
+ */
+export function indentUnitOf(size: number): string {
+  const n = Number.isFinite(size) && size > 0 ? Math.floor(size) : INDENT_UNIT.length;
+  return ' '.repeat(n);
+}
+
+/**
+ * 缩进 / 反缩进若干行。
+ *
+ * 缩进：每行行首加一个缩进单位；反缩进：每行行首吃掉一个 Tab，或至多一个缩进单位的空格。
+ * 一次处理 `[from, to]` 覆盖到的所有行 —— Tab 有选区时就是走这条路径。
+ *
+ * @param text 全文
+ * @param from 选区起点（含）
+ * @param to 选区终点（含）；无选区时与 `from` 相同
+ * @param dir `'in'` 缩进；`'out'` 反缩进
+ * @param unit 缩进单位串，见 indentUnitOf
+ * @returns 新文本与新选区（保持原选中范围，两端随增删平移）
+ */
+export function indentLines(
+  text: string,
+  from: number,
+  to: number,
+  dir: 'in' | 'out',
+  unit: string = INDENT_UNIT,
+): EditResult {
+  const lo = Math.max(0, Math.min(from, to));
+  const hi = Math.max(from, to);
+
+  // 逐行处理：从后往前改，前面的下标才不会被打乱
+  const bounds: { start: number; end: number }[] = [];
+  let at = lineBoundsAt(text, lo).start;
+  for (;;) {
+    const b = lineBoundsAt(text, at);
+    bounds.push(b);
+    if (b.end >= hi || b.end >= text.length) break;
+    at = b.end + 1;
+  }
+
+  let next = text;
+  // 每一处增删都会让「选区起点之前」的长度变化，累加起来才是新选区
+  let deltaAtLo = 0;
+  let deltaAtHi = 0;
+
+  for (let k = bounds.length - 1; k >= 0; k--) {
+    const { start, end } = bounds[k];
+    const line = next.slice(start, end);
+    let change: { text: string; delta: number };
+
+    if (dir === 'in') {
+      change = { text: unit + line, delta: unit.length };
+    } else {
+      let drop = 0;
+      if (line.startsWith('\t')) drop = 1;
+      else drop = (line.match(new RegExp(`^ {1,${unit.length}}`))?.[0] ?? '').length;
+      change = drop === 0 ? { text: line, delta: 0 } : { text: line.slice(drop), delta: -drop };
+    }
+
+    next = next.slice(0, start) + change.text + next.slice(end);
+    // 本行起点在选区起点之前 → 影响选区起点
+    if (start <= lo) deltaAtLo += change.delta;
+    // 本行起点在选区终点之前 → 影响选区终点
+    if (start <= hi) deltaAtHi += change.delta;
+  }
+
+  return {
+    text: next,
+    caret: Math.max(0, hi + deltaAtHi),
+    select: {
+      start: Math.max(0, lo + deltaAtLo),
+      end: Math.max(0, hi + deltaAtHi),
+    },
+  };
+}
+
+/**
+ * 光标所在行的缩进 / 反缩进（Ctrl+[ / Ctrl+]、无选区时的 Tab）。
  *
  * @param text 全文
  * @param caret 光标位置
  * @param dir `'in'` 缩进；`'out'` 反缩进
+ * @param unit 缩进单位串，见 indentUnitOf
  * @returns 新文本与新光标
  */
-export function indentLine(text: string, caret: number, dir: 'in' | 'out'): EditResult {
-  const { start, end } = lineBoundsAt(text, caret);
-  const line = text.slice(start, end);
-
-  if (dir === 'in') {
-    const next = text.slice(0, start) + INDENT_UNIT + line + text.slice(end);
-    return { text: next, caret: caret + INDENT_UNIT.length };
-  }
-
-  let drop = 0;
-  if (line.startsWith('\t')) drop = 1;
-  else drop = (line.match(new RegExp(`^ {1,${INDENT_UNIT.length}}`))?.[0] ?? '').length;
-  if (drop === 0) return { text, caret };
-  return {
-    text: text.slice(0, start) + line.slice(drop) + text.slice(end),
-    caret: Math.max(start, caret - drop),
-  };
+export function indentLine(
+  text: string,
+  caret: number,
+  dir: 'in' | 'out',
+  unit: string = INDENT_UNIT,
+): EditResult {
+  const r = indentLines(text, caret, caret, dir, unit);
+  // 无选区时只关心光标；indentLines 的 selection.end 就是新光标
+  return { text: r.text, caret: r.caret };
 }
 
 /**

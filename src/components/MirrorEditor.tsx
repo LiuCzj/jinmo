@@ -44,11 +44,16 @@ import {
   findAll,
   getContext,
   indentLine,
+  indentLines,
+  indentUnitAt,
+  inTable,
   inlineTargetAt,
   insertBlock,
   insertImage,
   insertLink,
   insertParagraph,
+  INDENT_SIZE_CHOICES,
+  CODE_INDENT_SIZE_DEFAULT,
   lineBoundsAt,
   makeTableSnippet,
   SNIPPETS,
@@ -63,6 +68,7 @@ import {
   tableInsertColumn,
   tableInsertRow,
   tablePosAt,
+  tableTabTarget,
   unwrapSelection,
   wrapSelection,
   type FindHit,
@@ -572,6 +578,28 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       return false;
     }
   });
+  /**
+   * 代码块的行长是否折行。默认 **折行**（true），值存 localStorage。
+   * 关掉后代码块内长行横向滚动，不再撑宽整页。
+   */
+  const [codeWrap, setCodeWrap] = useState(() => {
+    try {
+      return localStorage.getItem('jinmo.codeNoWrap') !== '1';
+    } catch {
+      return true;
+    }
+  });
+  /**
+   * 代码块内 Tab 的缩进宽度（空格数）。默认 4，与正文缩进（2 空格）相互独立。
+   */
+  const [codeIndentSize, setCodeIndentSize] = useState(() => {
+    try {
+      const raw = Number(localStorage.getItem('jinmo.codeIndentSize'));
+      return Number.isFinite(raw) && raw > 0 ? raw : CODE_INDENT_SIZE_DEFAULT;
+    } catch {
+      return CODE_INDENT_SIZE_DEFAULT;
+    }
+  });
   const lines = useMemo(() => buildLines(value, codeLineNumbers), [value, codeLineNumbers]);
   const [caret, setCaret] = useState<Caret>(0);
   /** 专注模式（F8）：只留当前块清晰，其余变淡 */
@@ -1002,7 +1030,16 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       lastKindRef.current = kind;
       onChange(r.text);
       setCaret(r.caret);
-      setAnchor(null);
+      /**
+       * 多行缩进这类命令要保留原选中范围（Tab 连按才能继续缩进同一段）。
+       * 其余命令一律收起选区。
+       */
+      if (r.select) {
+        setAnchor(r.select.start === r.select.end ? null : r.select.start);
+        setCaret(r.select.end);
+      } else {
+        setAnchor(null);
+      }
     },
     [onChange],
   );
@@ -1309,8 +1346,15 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       if (id === 'todo') return setLinePrefix('- [ ] ');
 
       // ── 缩进 / 反缩进（Ctrl+[ / Ctrl+]） ──
-      if (id === 'indent') return applyEdit(indentLine(value, caret, 'in'));
-      if (id === 'outdent') return applyEdit(indentLine(value, caret, 'out'));
+      if (id === 'indent' || id === 'outdent') {
+        const dir = id === 'indent' ? 'in' : 'out';
+        const unit = indentUnitAt(value, caret, codeIndentSize);
+        // 有选区就整段缩进；无选区只动光标那一行
+        if (sel.end > sel.start) {
+          return applyEdit(indentLines(value, sel.start, sel.end, dir, unit));
+        }
+        return applyEdit(indentLine(value, caret, dir, unit));
+      }
 
       // ── 升降标题级别（Ctrl+= / Ctrl+-） ──
       if (id === 'heading-up') return applyEdit(changeHeadingLevel(value, caret, 1));
@@ -1546,8 +1590,52 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         return;
       }
 
-      // ── 代码块：复制内容 / 跳到块外 / 行号开关 ──
-      if (id === 'code-copy' || id === 'code-exit' || id === 'code-lineno') {
+      // ── 代码块：复制内容 / 跳到块外 / 语言 / 行号 / 折行 / 缩进宽度 ──
+      if (
+        id === 'code-copy' ||
+        id === 'code-exit' ||
+        id === 'code-lineno' ||
+        id === 'code-wrap' ||
+        id === 'code-lang' ||
+        id.startsWith('code-indent:')
+      ) {
+        // 缩进宽度与语言不需要定位到围栏，先单独处理
+        if (id.startsWith('code-indent:')) {
+          const size = Number(id.slice('code-indent:'.length));
+          if (!Number.isFinite(size) || size <= 0) return;
+          setCodeIndentSize(size);
+          try {
+            localStorage.setItem('jinmo.codeIndentSize', String(size));
+          } catch {
+            /* 隐私模式下写不了，忽略 */
+          }
+          setNotice(`代码块缩进宽度：${size} 个空格`);
+          return;
+        }
+        if (id === 'code-wrap') {
+          const next = !codeWrap;
+          setCodeWrap(next);
+          try {
+            localStorage.setItem('jinmo.codeNoWrap', next ? '0' : '1');
+          } catch {
+            /* 隐私模式下写不了，忽略 */
+          }
+          setNotice(next ? '代码块恢复折行' : '代码块不折行（横向滚动）');
+          return;
+        }
+        if (id === 'code-lang') {
+          const li = lineIndexOf(value, caret).index;
+          const el = lineEls.current[li];
+          const r = el?.getBoundingClientRect();
+          setMenu(null);
+          setBubble(null);
+          setLangPicker({
+            lineIndex: codeBlockRangeAt(li).open,
+            pos: { x: r?.left ?? 120, y: (r?.bottom ?? 120) + 4 },
+          });
+          return;
+        }
+
         const all = value.split('\n');
         const { open, close } = codeBlockRangeAt(lineIndexOf(value, caret).index);
         if (open === -1) return;
@@ -1659,7 +1747,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       ? hit.kind === 'image'
         ? buildImageMenu()
         : buildLinkMenu()
-      : buildContextMenu(getContext(value, pos), { extended: true, codeLineNumbers });
+      : buildContextMenu(getContext(value, pos), { extended: true, codeLineNumbers, codeWrap, codeIndentSize });
     setMenu({ pos: { x: e.clientX, y: e.clientY }, items, target });
   };
 
@@ -1678,15 +1766,75 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       const line = lines[li];
       if (!line || !wrapRef.current) return caret;
       const wr = wrapRef.current.getBoundingClientRect();
+      const el = lineEls.current[li];
       const map = buildCharMap(li);
       let next = line.start + line.kind.prefixLen;
 
+      /**
+       * ── 折行后的命中修正 ──
+       *
+       * 代码块与长段落折行后，同一个「逻辑行」在屏幕上占多个「视觉行」。
+       * 只按 X 找字符 → 点到第二视觉行会落到第一视觉行的字上（看着点在缩进后的位置、光标却跳到上面）。
+       *
+       * 浏览器原生的 `caretRangeFromPoint` 本来就按「视觉行 + X」命中，先拿它锁定**视觉行**；
+       * 但它是按最近字符边界吸附的（点在字右半边仍返回字前），
+       * 所以**列号仍要自己算**：在该视觉行范围内，按点击点落在字符中点的哪一侧决定 before/after。
+       * 两个都失败（旧内核、点到行外）时才退回纯手算。
+       */
+      const nativeBand = (): { top: number; bottom: number } | null => {
+        if (clientY === undefined || !el) return null;
+        // 点必须真的落在这个行元素上，否则会命中隔壁行
+        if (clientX < elBox.left || clientX > elBox.right || clientY < elBox.top || clientY > elBox.bottom)
+          return null;
+        const anyDoc = document as Document & {
+          caretRangeFromPoint?: (x: number, y: number) => Range | null;
+          caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+        };
+        let node: Node | null = null;
+        let offset = 0;
+        if (typeof anyDoc.caretRangeFromPoint === 'function') {
+          const r = anyDoc.caretRangeFromPoint(clientX, clientY);
+          if (r) {
+            node = r.startContainer;
+            offset = r.startOffset;
+          }
+        } else if (typeof anyDoc.caretPositionFromPoint === 'function') {
+          const p = anyDoc.caretPositionFromPoint(clientX, clientY);
+          if (p) {
+            node = p.offsetNode;
+            offset = p.offset;
+          }
+        }
+        if (!node || node.nodeType !== Node.TEXT_NODE) return null;
+        // 用命中的那个字符圈出「视觉行」的上下界
+        const hit = map.find((c) => c.node === node && c.offset === offset);
+        const anchor = hit ?? map.find((c) => c.node === node);
+        if (!anchor) return null;
+        const r = document.createRange();
+        r.setStart(anchor.node, Math.min(anchor.offset, (anchor.node.nodeValue ?? '').length - 1));
+        r.setEnd(r.startContainer, Math.min(anchor.offset + 1, (anchor.node.nodeValue ?? '').length));
+        const rr = r.getBoundingClientRect();
+        if (!rr.height && !rr.width) return null;
+        // 上下各放 3px 容差，紧贴视觉行边缘点击时不至于掉进相邻视觉行
+        return { top: rr.top - 3, bottom: rr.bottom + 3 };
+      };
+
+      const elBox = el?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
+
       if (line.kind.type !== 'hr' && map.length) {
         const clickRel = clientX - wr.left;
-        // 第一遍：找 Y 上离点击最近的可见字符，用它的上下缘圈出「视觉行」
+        /**
+         * 第一遍：锁定视觉行。
+         * 优先用浏览器原生命中（折行、缩进、等宽字体全都自动对上），
+         * 拿不到就退回「按 Y 找最近字符」。
+         */
         let bandTop = Number.NEGATIVE_INFINITY;
         let bandBottom = Number.POSITIVE_INFINITY;
-        if (clientY !== undefined) {
+        const native = nativeBand();
+        if (native) {
+          bandTop = native.top;
+          bandBottom = native.bottom;
+        } else if (clientY !== undefined) {
           let bestDy = Number.POSITIVE_INFINITY;
           let bestRect: DOMRect | null = null;
           for (const c of map) {
@@ -1707,7 +1855,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             bandBottom = bestRect.bottom + 2;
           }
         }
-        // 第二遍：视觉行内按 X 找最近字符
+        // 第二遍：视觉行内按 X 找最近字符。点左半边落在字前、右半边落在字后
         let bestDist = Number.POSITIVE_INFINITY;
         for (const c of map) {
           if (c.src === null) continue;
@@ -1729,7 +1877,6 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       // 表格：光标必须落在「被点的那一格」的源码范围内。
       // 格与格之间的 `|` 不渲染，不钳住就会算到隔壁格去（看着在第一格、打字却进第二格）
       if (line.kind.type === 'tableHead' || line.kind.type === 'tableBody') {
-        const el = lineEls.current[li];
         const cells = el ? [...el.children] : [];
         const hitIdx = cells.findIndex((c) => {
           const r = c.getBoundingClientRect();
@@ -2099,6 +2246,42 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     const selStart = hasSel ? Math.min(anchor!, caret) : caret;
     const selEnd = hasSel ? Math.max(anchor!, caret) : caret;
 
+    /**
+     * ── Tab / Shift+Tab ──
+     *
+     * 规则（对齐主流代码编辑器）：
+     *  - 表格内：跳到下一格；末格跳下一行首格；末行末格不加行，直接停在块尾
+     *  - 有选区：缩进 / 反缩进选区覆盖到的每一行，并保留选区
+     *  - 无选区：插入一个缩进单位（代码块内 4 空格，正文 2 空格）
+     *
+     * 必须 preventDefault —— 否则浏览器会把焦点移出编辑器，Tab 在编辑器里直接失效。
+     */
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const dir: 1 | -1 = e.shiftKey ? -1 : 1;
+
+      if (inTable(value, caret)) {
+        const target = tableTabTarget(value, caret, dir);
+        if (target !== null) {
+          setAnchor(null);
+          setCaret(target);
+        } else if (dir === 1) {
+          setNotice('已在表格末尾');
+        }
+        return;
+      }
+
+      const unit = indentUnitAt(value, caret, codeIndentSize);
+      if (hasSel) {
+        applyEdit(indentLines(value, selStart, selEnd, dir === 1 ? 'in' : 'out', unit));
+      } else if (dir === 1) {
+        applyEdit(insertAt(value, caret, unit), 'input');
+      } else {
+        applyEdit(indentLine(value, caret, 'out', unit), 'input');
+      }
+      return;
+    }
+
     switch (e.key) {
       case 'Backspace': {
         e.preventDefault();
@@ -2398,7 +2581,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     setBubble(null);
     setMenu({
       pos: { x: e.clientX, y: e.clientY },
-      items: buildContextMenu(getContext(value, pos), { extended: true, codeLineNumbers }),
+      items: buildContextMenu(getContext(value, pos), { extended: true, codeLineNumbers, codeWrap, codeIndentSize }),
       target: null,
     });
   };
@@ -2539,6 +2722,78 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     );
   }
 
+  /**
+   * 渲染一行。抽出来是因为代码块要把连续若干行塞进同一个容器里。
+   *
+   * @param i 行下标
+   * @param inFence 本行是否在代码块容器内（容器已画边框，行不再自己补边）
+   * @returns 行元素
+   */
+  const renderLine = (i: number, inFence: boolean) => {
+    const l = lines[i];
+    if (!l) return null;
+    return (
+      <EditorLine
+        key={i}
+        line={l}
+        index={i}
+        editing={isEditingLine(i)}
+        mathEditing={
+          l.mathBlockFirst !== undefined &&
+          caretLine >= (l.mathBlockFirst ?? 0) &&
+          caretLine <= (l.mathBlockLast ?? 0)
+        }
+        dimmed={!!(focusMode && focusBlock && !focusBlock.has(i))}
+        isTableLast={
+          (l.kind.type === 'tableHead' || l.kind.type === 'tableBody') &&
+          lines[i + 1]?.kind.type !== 'tableBody' &&
+          lines[i + 1]?.kind.type !== 'tableSep'
+        }
+        isCodeFirst={!inFence && isCodeLike(lines, i) && !isCodeLike(lines, i - 1)}
+        isCodeLast={!inFence && isCodeLike(lines, i) && !isCodeLike(lines, i + 1)}
+        selStart={selLo === null ? 0 : selLo - l.start}
+        selEnd={selHi === null ? 0 : selHi - l.start}
+        caretCol={i === caretLine ? caret - l.start : -1}
+        preedit={i === caretLine ? preedit : ''}
+        lineHits={hitsForLine(i)}
+        onLineClick={stableLineClick}
+        onLineMouseDown={stableLineMouseDown}
+        onContextMenu={stableContextMenu}
+        onToggleTask={toggleTaskAt}
+        onPickLang={stablePickLang}
+        registerLine={registerLine}
+      />
+    );
+  };
+
+  /**
+   * 逐个块渲染整篇：代码块整体包进 `.md-fences` 容器，其余行平铺。
+   *
+   * 容器负责边框 / 圆角 / 底色 / 外距；行元素仍是容器的直接子节点，
+   * 因此 `lineEls` 下标、`data-li`、字符映射表全都不变。
+   *
+   * @returns 块级元素数组
+   */
+  const renderBlocks = () => {
+    const out: React.ReactNode[] = [];
+    for (let i = 0; i < lines.length; ) {
+      if (isCodeLike(lines, i)) {
+        let j = i;
+        while (j + 1 < lines.length && isCodeLike(lines, j + 1)) j++;
+        out.push(
+          <div key={`f${i}`} className="md-fences">
+            {lines.slice(i, j + 1).map((_, k) => renderLine(i + k, true))}
+          </div>,
+        );
+        i = j + 1;
+      } else {
+        out.push(renderLine(i, false));
+        i++;
+      }
+    }
+    return out;
+  };
+
   return (
     <div
       className={`relative bg-background transition-colors ${
@@ -2593,45 +2848,26 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         `select-none` 是必须的：选区由编辑器自己画（见 renderSegs 的 bg-accent/25），
         原生选区会和它叠在一起，且原生那份会被任何一次重渲染抹掉。
       */}
-      <div ref={wrapRef} className="relative select-none px-[30px] pt-[30px] pb-[100px] text-base leading-[1.6]">
+      <div
+        ref={wrapRef}
+        className={`relative select-none px-[30px] pt-[30px] pb-[100px] text-base leading-[1.6]${
+          codeWrap ? '' : ' md-nowrap'
+        }`}
+      >
         {/* 空文档提示：放在行元素之外，不进字符映射表 */}
         {value === '' && (
           <div className="pointer-events-none absolute top-[30px] left-[30px] text-muted-foreground/45">
             开始输入，或按 Ctrl+O 打开文件
           </div>
         )}
-        {lines.map((l, i) => (
-          <EditorLine
-            key={i}
-            line={l}
-            index={i}
-            editing={isEditingLine(i)}
-            mathEditing={
-              l.mathBlockFirst !== undefined &&
-              caretLine >= (l.mathBlockFirst ?? 0) &&
-              caretLine <= (l.mathBlockLast ?? 0)
-            }
-            dimmed={!!(focusMode && focusBlock && !focusBlock.has(i))}
-            isTableLast={
-              (l.kind.type === 'tableHead' || l.kind.type === 'tableBody') &&
-              lines[i + 1]?.kind.type !== 'tableBody' &&
-              lines[i + 1]?.kind.type !== 'tableSep'
-            }
-            isCodeFirst={isCodeLike(lines, i) && !isCodeLike(lines, i - 1)}
-            isCodeLast={isCodeLike(lines, i) && !isCodeLike(lines, i + 1)}
-            selStart={selLo === null ? 0 : selLo - l.start}
-            selEnd={selHi === null ? 0 : selHi - l.start}
-            caretCol={i === caretLine ? caret - l.start : -1}
-            preedit={i === caretLine ? preedit : ''}
-            lineHits={hitsForLine(i)}
-            onLineClick={stableLineClick}
-            onLineMouseDown={stableLineMouseDown}
-            onContextMenu={stableContextMenu}
-            onToggleTask={toggleTaskAt}
-            onPickLang={stablePickLang}
-            registerLine={registerLine}
-          />
-        ))}
+        {/*
+          渲染顺序：代码块的连续行被包进一个 `.md-fences` 容器里，
+          边框、圆角、底色、15px 外距都画在这个容器上（而不是逐行补边）。
+
+          容器只是**视觉分组**：行元素本身仍在容器内、仍带 `data-li`，
+          `lineEls.current` 的下标与 `lines` 一一对应，光标定位与右键落点不受影响。
+        */}
+        {renderBlocks()}
         {caretBox && (
           <div
             className={`pointer-events-none absolute w-[2px] bg-accent ${

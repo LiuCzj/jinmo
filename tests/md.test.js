@@ -576,6 +576,82 @@ it('fenceAttrs: 行号属性块', () => {
   assert.strictEqual(langs.fenceAttrs(false, 5), '{startFrom="5"}');
 });
 
+// ── 缩进（Tab / Shift+Tab / Ctrl+[ ]） ──
+
+it('indentUnitOf: 宽度转缩进串', () => {
+  assert.strictEqual(cmd.indentUnitOf(4), '    ');
+  assert.strictEqual(cmd.indentUnitOf(2), '  ');
+  assert.strictEqual(cmd.indentUnitOf(8), '        ');
+  // 非法宽度回退到正文单位（2 空格）
+  assert.strictEqual(cmd.indentUnitOf(0), '  ');
+  assert.strictEqual(cmd.indentUnitOf(-1), '  ');
+  assert.strictEqual(cmd.indentUnitOf(NaN), '  ');
+});
+
+it('indentLines: 多行缩进保留选区，两端同步平移', () => {
+  const text = 'aa\nbb\ncc';
+  // 选中第 2、3 行（下标 3 到 8）
+  const r = cmd.indentLines(text, 3, 8, 'in', '  ');
+  assert.strictEqual(r.text, 'aa\n  bb\n  cc');
+  assert.deepStrictEqual(r.select, { start: 5, end: 12 }, '选区两端都要跟着向后平移');
+  assert.strictEqual(r.caret, 12);
+});
+
+it('indentLines: 多行反缩进，已到行首的行不动', () => {
+  const text = '  aa\n    bb\ncc';
+  const r = cmd.indentLines(text, 0, text.length, 'out', '  ');
+  assert.strictEqual(r.text, 'aa\n  bb\ncc', '第三行没有缩进可退，保持不变');
+  assert.deepStrictEqual(r.select, { start: 0, end: r.text.length });
+});
+
+it('indentLines: 反缩进优先吃一个 Tab', () => {
+  const r = cmd.indentLines('\taa', 0, 3, 'out', '  ');
+  assert.strictEqual(r.text, 'aa', 'Tab 占一格，一次吃一整个');
+});
+
+it('indentLine: 单行缩进用给定宽度', () => {
+  assert.strictEqual(cmd.indentLine('aa', 0, 'in', '    ').text, '    aa');
+  assert.strictEqual(cmd.indentLine('aa', 1, 'in', '    ').caret, 5, '光标随插入内容平移');
+});
+
+it('indentUnitAt: 代码块内用代码宽度，块外用正文宽度', () => {
+  const text = 'para\n\n```py\nx = 1\n```\n';
+  const offset = text.indexOf('x = 1');
+  assert.strictEqual(cmd.indentUnitAt(text, offset, 4), '    ', '代码块内用 4 空格');
+  assert.strictEqual(cmd.indentUnitAt(text, 1, 4), '  ', '块外仍用正文 2 空格');
+});
+
+// ── 表格里按 Tab 跳格 ──
+
+it('tableTabTarget: 跳到下一格内容的开头', () => {
+  const text = '| a | b |\n| --- | --- |\n| c | d |\n';
+  // 光标在表头 `a` 上 → 跳到 `b`
+  const b = cmd.tableTabTarget(text, 3, 1);
+  assert.strictEqual(text.slice(b, b + 1), 'b');
+});
+
+it('tableTabTarget: 末格跳到下一行首格，跳过分隔行', () => {
+  const text = '| a | b |\n| --- | --- |\n| c | d |\n';
+  // 表头末格 `b`（下标 6）→ 应落到正文行首格 `c`，不能落在分隔行
+  const c = cmd.tableTabTarget(text, 6, 1);
+  assert.strictEqual(text.slice(c, c + 1), 'c');
+});
+
+it('tableTabTarget: 逆向跳格（Shift+Tab）', () => {
+  const text = '| a | b |\n| --- | --- |\n| c | d |\n';
+  const a = cmd.tableTabTarget(text, text.indexOf('c'), -1);
+  assert.strictEqual(text.slice(a, a + 1), 'b', '正文首格反向跳回表头末格');
+});
+
+it('tableTabTarget: 表格末尾再往后跳返回 null', () => {
+  const text = '| a | b |\n| --- | --- |\n| c | d |\n';
+  assert.strictEqual(cmd.tableTabTarget(text, text.indexOf('d'), 1), null);
+});
+
+it('tableTabTarget: 不在表格里返回 null', () => {
+  assert.strictEqual(cmd.tableTabTarget('普通段落', 1, 1), null);
+});
+
 console.log('\n──────────────────────────────');
 console.log(`结果：${passed} 通过, ${failed} 失败`);
 if (failed > 0) process.exit(1);

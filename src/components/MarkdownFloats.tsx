@@ -52,8 +52,9 @@ import {
   AlignLeft,
   Sigma,
   Search,
+  IndentIncrease,
 } from 'lucide-react';
-import type { ContextInfo } from '@/lib/md-commands';
+import { INDENT_SIZE_CHOICES, type ContextInfo } from '@/lib/md-commands';
 import { matchLangs, PLAIN_LANG_LABEL, MAX_LANG_HINTS } from '@/lib/code-langs';
 
 /** 一条可执行的编辑命令 */
@@ -845,19 +846,51 @@ export function tableSubmenu(): MdSubmenu {
 }
 
 /**
+ * `缩进宽度 ▸` 子菜单：只影响当前光标所在的代码块缩进，不影响正文。
+ *
+ * 候选取 2 / 4 / 8（与 lib/md-commands 的 INDENT_SIZE_CHOICES 一致），
+ * 命令 id 形如 `code-indent:4`，由调用方解析。
+ *
+ * @param current 当前生效的缩进宽度（空格数）
+ * @returns 子菜单条目
+ */
+function codeIndentSubmenu(current?: number): MdSubmenu {
+  return {
+    label: '缩进宽度',
+    icon: IndentIncrease,
+    items: INDENT_SIZE_CHOICES.map((n) => ({
+      id: `code-indent:${n}`,
+      label: `${n} 个空格`,
+      icon: IndentIncrease,
+      active: current === n,
+    })),
+  };
+}
+
+/**
  * 按光标上下文生成右键菜单项。
  *
- * 结构要短：行内格式收成一排图标、标题与插入收进子菜单。
- * 平铺 21 条约 640px，普通屏幕上会顶到视口外、有些项看不见。
+ * **按上下文动态显隐**，不再是一份固定长列表：
+ *  - 代码块里只留「块级」操作（跳出 / 语言 / 行号 / 折行 / 缩进宽度 / 插入），
+ *    行内格式、清除格式、段落子菜单一并隐藏 —— 代码块内改标题、加粗都没有意义；
+ *  - 表格里显示「表格 ▸」、隐藏「段落 ▸」（标题与表格互斥）；
+ *  - 其余位置显示行内格式 + 段落 + 插入。
  *
  * @param ctx 光标上下文（lib/md-commands.ts 的 getContext 产出）
- * @param opts.extended 真时补上撤销/重做、全选、清除格式，表格组换成完整版
- * （默认关）
+ * @param opts.extended 真时补上撤销/重做、全选
+ * @param opts.codeLineNumbers 代码块全局行号开关当前值
+ * @param opts.codeWrap 代码块当前是否折行
+ * @param opts.codeIndentSize 代码块当前缩进宽度（空格数）
  * @returns 菜单条目（含分隔线 / 子菜单 / 图标行）
  */
 export function buildContextMenu(
   ctx: ContextInfo,
-  opts: { extended?: boolean; codeLineNumbers?: boolean } = {},
+  opts: {
+    extended?: boolean;
+    codeLineNumbers?: boolean;
+    codeWrap?: boolean;
+    codeIndentSize?: number;
+  } = {},
 ): MdMenuItem[] {
   const items: MdMenuItem[] = [];
 
@@ -871,23 +904,31 @@ export function buildContextMenu(
 
   items.push(...clipboardGroup());
 
-  // ── 代码块里：跳出 / 行号 / 复制内容，外加段落与插入 ──
+  // ── 代码块里：只管块本身，行内格式与段落全部隐藏 ──
   if (ctx.code) {
     items.push({ separator: true });
+    items.push({ id: 'code-copy', label: '复制代码块内容', icon: Copy });
     items.push({ id: 'code-exit', label: '在下方跳出代码块', icon: Code2 });
+    items.push({ separator: true });
+    items.push({ id: 'code-lang', label: '选择语言…', icon: Type });
     items.push({
       id: 'code-lineno',
       label: opts.codeLineNumbers ? '隐藏行号' : '显示行号',
       icon: ListOrdered,
       active: !!opts.codeLineNumbers,
     });
-    items.push({ id: 'code-copy', label: '复制代码块内容', icon: Copy });
+    items.push({
+      id: 'code-wrap',
+      label: opts.codeWrap === false ? '恢复折行' : '不折行（横向滚动）',
+      icon: AlignLeft,
+      active: opts.codeWrap === false,
+    });
+    items.push(codeIndentSubmenu(opts.codeIndentSize));
     items.push({ separator: true });
     /*
-     * 段落 / 插入 在代码块里也必须有 —— 少了它们，光标在代码块里时就插不了表格、代码块，
-     * 只能先「跳出」再重新右键，两段代码挨在一起时根本分不清谁是谁。
+     * 只留「插入」：块内插不了段落层级，但常要在代码块前后补表格、公式、另一个代码块，
+     * 全靠「跳出」再右键会分不清是哪一块。
      */
-    items.push(paragraphSubmenu(ctx));
     items.push(insertSubmenu());
     items.push({ separator: true });
     items.push(...deleteGroup());
@@ -904,14 +945,13 @@ export function buildContextMenu(
     items.push({ id: 'select-all', label: '全选', icon: TextSelect, hint: 'Ctrl+A' });
   }
 
-  // ── 表格里：完整表格操作收进「表格 ▸」 ──
-  if (ctx.table) {
-    items.push({ separator: true });
-    items.push(tableSubmenu());
-  }
-
   items.push({ separator: true });
-  items.push(paragraphSubmenu(ctx));
+  if (ctx.table) {
+    // 表格里给完整表格操作；段落层级（标题）与表格互斥，不显示
+    items.push(tableSubmenu());
+  } else {
+    items.push(paragraphSubmenu(ctx));
+  }
   items.push(insertSubmenu());
   items.push({ separator: true });
   items.push(...deleteGroup());

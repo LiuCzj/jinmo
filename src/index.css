@@ -199,17 +199,39 @@
 
   /* ── 代码块与表格底色，照 github.css ── */
 
-  /* 代码块：连续若干行共用一块灰底，靠负外边距让底色比正文宽出一点 */
+  /*
+   * 代码块容器。数值照 github.css：`margin:15px 0;padding:8px 0 6px;
+   * border:1px solid #e7eaed;border-radius:3px;background:#f8f8f8`。
+   *
+   * 边框、圆角、底色、外距都画在这一层；里面的行只铺底色、不再各自补边。
+   */
+  .md-fences {
+    position: relative;
+    margin: 15px 0;
+    padding: 8px 0 6px;
+    border: 1px solid hsl(0 0% 91%);
+    border-radius: 3px;
+    background-color: hsl(0 0% 97%);
+  }
+
+  /*
+   * 不折行模式：整块横向可滚，长行不再折到下一行。
+   *
+   * 必须用 `pre`：`pre-wrap` 会照折行。滚动条挂在编辑区外层而不是块上，
+   * 否则每块各有一条横向滚动条、还对不齐。外层加 `md-nowrap` 一个类即可。
+   */
+  .md-nowrap .md-code-line {
+    white-space: pre;
+  }
+  .md-nowrap {
+    overflow-x: auto;
+  }
+
+  /* 代码行：只铺底色与左右内边距，边框交给外层 .md-fences */
   .md-code-line {
     position: relative;
-    background-color: hsl(0 0% 97%);
-    border-left: 1px solid hsl(0 0% 91%);
-    border-right: 1px solid hsl(0 0% 91%);
     padding-right: 8px;
     padding-left: 8px;
-    /* 左右各 9px = 8px 内边距 + 1px 边框，正文才能和段落文字对齐 */
-    margin-right: -9px;
-    margin-left: -9px;
     /*
      * pre-wrap：保留所有空白（含前导空格与 tab），同时允许长行折行。
      *
@@ -217,25 +239,6 @@
      * 不用 `pre`：那样长代码行会横向溢出、把整页撑宽。
      */
     white-space: pre-wrap;
-  }
-
-  /*
-   * 代码块的首行 / 末行。
-   * 数值：`margin:15px 0;padding:8px 0 6px;border:1px solid #e7eaed;border-radius:3px`。
-   */
-  .md-code-first {
-    border-top: 1px solid hsl(0 0% 91%);
-    border-top-left-radius: 3px;
-    border-top-right-radius: 3px;
-    margin-top: 15px;
-    padding-top: 8px;
-  }
-  .md-code-last {
-    border-bottom: 1px solid hsl(0 0% 91%);
-    border-bottom-left-radius: 3px;
-    border-bottom-right-radius: 3px;
-    margin-bottom: 15px;
-    padding-bottom: 6px;
   }
 
   /*
