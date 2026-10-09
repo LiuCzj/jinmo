@@ -4,6 +4,8 @@
  * 纯函数：输入文本与光标位置，输出新文本与新光标位置。不改原值，不依赖外部状态。
  */
 
+import { parseFenceOptions } from './code-langs';
+
 /** 一次编辑的结果：改写后的文本 + 光标应该落在哪里 */
 export interface EditResult {
   /** 改写后的完整文本 */
@@ -375,19 +377,21 @@ export function insertBlock(
 ): EditResult {
   const { start, end } = lineBoundsAt(text, caret);
 
-  // 当前行为空行时原地填入
+  // 当前行为空行时原地填入。空文档里必须走这条：否则会先垫出两个空行，
+  // 表格看起来像是被插到了文末而不是光标处。
   if (text.slice(start, end).trim() === '') {
     const next = text.slice(0, start) + snippet + text.slice(end);
     return { text: next, caret: start + snippetInnerOffset(snippet) };
   }
 
+  // 非空行的上下另起一段，中间留一个空行：紧贴上一段时表格会被当成段落的一部分
   if (where === 'above') {
-    const next = text.slice(0, start) + snippet + '\n' + text.slice(start);
+    const next = text.slice(0, start) + snippet + '\n\n' + text.slice(start);
     return { text: next, caret: start + snippetInnerOffset(snippet) };
   }
 
-  const next = text.slice(0, end) + '\n' + snippet + text.slice(end);
-  return { text: next, caret: end + 1 + snippetInnerOffset(snippet) };
+  const next = text.slice(0, end) + '\n\n' + snippet + text.slice(end);
+  return { text: next, caret: end + 2 + snippetInnerOffset(snippet) };
 }
 
 /**
@@ -401,15 +405,39 @@ export function snippetInnerOffset(snippet: string): number {
     const nl = snippet.indexOf('\n');
     return nl === -1 ? snippet.length : nl + 1;
   }
+  // 公式块：落到两个 $$ 之间
+  if (snippet.startsWith('$$')) {
+    const nl = snippet.indexOf('\n');
+    return nl === -1 ? snippet.length : nl + 1;
+  }
   // 表格：落到第一个单元格内（`| ` 之后）
   if (snippet.startsWith('|')) {
     const bar = snippet.indexOf('| ');
     return bar === -1 ? snippet.length : bar + 2;
   }
+  // 链接引用定义：落到 `[id]: ` 之后，方便直接粘 URL
+  const def = snippet.match(/^\[[^\]]+\]:\s/);
+  if (def) return def[0].length;
   // 引用 / 列表：落到标记之后
   const m = snippet.match(/^(?:>\s?|[-*+]\s|\d+[.)]\s)/);
   if (m) return m[0].length;
   return snippet.length;
+}
+
+/**
+ * 在当前块的上下另起一个空段落（「段落（上方 / 下方）」）。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param where 'above' 插在当前块上方；'below' 插在下方
+ * @returns 新文本与光标（落在新出现的空行上）
+ */
+export function insertParagraph(text: string, caret: number, where: 'above' | 'below'): EditResult {
+  const { start, end } = lineBoundsAt(text, caret);
+  if (where === 'above') {
+    return { text: text.slice(0, start) + '\n' + text.slice(start), caret: start };
+  }
+  return { text: text.slice(0, end) + '\n' + text.slice(end), caret: end + 1 };
 }
 
 /** 预设的插入块内容 */
@@ -418,6 +446,14 @@ export const SNIPPETS = {
   table: '| 列 1 | 列 2 |\n| --- | --- |\n|  |  |\n|  |  |',
   /** 带语言标记的代码块 */
   code: '```\n\n```',
+  /** 块级公式（光标落在两个 $$ 之间） */
+  math: '$$\n\n$$',
+  /** 目录标记 `[TOC]` */
+  toc: '[TOC]',
+  /** 链接引用定义 */
+  linkref: '[1]: https://',
+  /** YAML Front Matter */
+  yaml: '---\ntitle: \n---',
   /** 单行引用 */
   quote: '> ',
   /** 分割线 */
@@ -687,15 +723,18 @@ export function tableDelete(text: string, caret: number): EditResult | null {
 /**
  * 按行列数拼一张空表源码。
  *
+ * 行数的口径：**含表头行**，不含分隔行（分隔行是表头的附属行，不算一行）。
+ * 所以 `rows = 3` 出来是「表头 + 分隔 + 2 个数据行」，渲染成 3 行。
+ *
  * @param cols 列数（≥1）
- * @param rows 总行数（含表头与分隔行，≥2）
+ * @param rows 总行数，含表头行（≥1）
  * @returns 表格源码（不含首尾换行）
  */
 export function makeTableSnippet(cols: number, rows: number): string {
   const c = Math.max(1, Math.min(12, Math.floor(cols) || 1));
-  const r = Math.max(2, Math.min(50, Math.floor(rows) || 2));
+  const r = Math.max(1, Math.min(50, Math.floor(rows) || 1));
   const lines = [rowOf(Array(c).fill('')), rowOf(Array(c).fill('---'))];
-  for (let i = 2; i < r; i++) lines.push(rowOf(Array(c).fill('')));
+  for (let i = 1; i < r; i++) lines.push(rowOf(Array(c).fill('')));
   return lines.join('\n');
 }
 
@@ -744,6 +783,8 @@ export function inCodeFence(text: string, caret: number): boolean {
 export interface ContextInfo {
   /** 在代码块里 */
   code: boolean;
+  /** 所在代码块是否开了行号（围栏属性 `{.numberLines}`） */
+  codeLineNumbers: boolean;
   /** 在表格里 */
   table: boolean;
   /** 所在行是不是列表项 */
@@ -769,8 +810,10 @@ export function getContext(text: string, caret: number): ContextInfo {
   const line = lineAt(text, caret);
   const trimmed = line.trim();
   const hm = /^\s*(#{1,6})\s/.exec(line);
+  const code = inCodeFence(text, caret);
   return {
-    code: inCodeFence(text, caret),
+    code,
+    codeLineNumbers: code && (parseFenceOptions(codeFenceInfo(text, caret) ?? '').lineNumbers ?? false),
     table: inTable(text, caret),
     list: /^\s*(?:[-*+]|\d+[.)])\s+/.test(line),
     quote: /^\s*>\s?/.test(line),
@@ -778,6 +821,40 @@ export function getContext(text: string, caret: number): ContextInfo {
     headingLevel: hm ? hm[1].length : 0,
     empty: trimmed === '',
   };
+}
+
+/**
+ * 取光标所在代码块的开围栏 info string（围栏符号之后那一串）。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @returns info string；不在代码块里则 null
+ */
+function codeFenceInfo(text: string, caret: number): string | null {
+  const lines = text.split('\n');
+  const FENCE = /^\s*(`{3,}|~{3,})/;
+  let pos = 0;
+  /** 当前开围栏的标记；null = 不在围栏里 */
+  let open: string | null = null;
+  let info: string | null = null;
+  for (const line of lines) {
+    const atThisLine = caret >= pos && caret <= pos + line.length;
+    const m = FENCE.exec(line);
+    if (m) {
+      if (open === null) {
+        open = m[1];
+        info = line.slice(m[0].length);
+      } else if (m[1][0] === open[0] && m[1].length >= open.length) {
+        // 闭围栏。光标正停在这一行上时仍算这个块，先把它当作块内
+        if (atThisLine) return info;
+        open = null;
+        info = null;
+      }
+    }
+    if (atThisLine) return info;
+    pos += line.length + 1;
+  }
+  return null;
 }
 
 /** 右键命中的行内目标（图片 / 链接语法） */

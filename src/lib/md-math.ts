@@ -1,5 +1,5 @@
 /**
- * 数学公式渲染，用 MathJax（与 Typora 同一个引擎）。
+ * 数学公式渲染，用 MathJax。
  *
  * 加载的是 MathJax 官方为浏览器准备的自包含包 `es5/tex-svg.js`：
  * 它加载完会把 `window.MathJax` 装好，不需要构建工具做模块转换

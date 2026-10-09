@@ -165,7 +165,7 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
       }
     }
 
-    // 行内公式 $...$。规则照 Typora 官方文档（接近 Pandoc）：
+    // 行内公式 $...$。规则接近 Pandoc：
     // 开 $ 后不能是空白；闭 $ 前不能是空白、前一字符不能是反斜杠、后不能紧跟数字（`$2` 保持文本）
     if (src[i] === '$' && src[i + 1] !== undefined && src[i + 1] !== '$' && !/\s/.test(src[i + 1])) {
       let j = i + 1;

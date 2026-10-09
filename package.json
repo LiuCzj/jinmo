@@ -1,7 +1,7 @@
 {
   "name": "jinmo",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "所见即所得的 Markdown 编辑器：语法随光标浮现，纯前端，可发布为网页或打包成桌面应用",
   "license": "AGPL-3.0-or-later",
@@ -12,8 +12,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tests/tsconfig.json && node tests/md.test.js",
-    "build:single": "npm run build && node scripts/build-single.mjs",
-    "desktop": "npm run build:single && electron .",
+    "build:single": "npm run typecheck && vite build --config vite.config.single.ts && node scripts/build-single.mjs",
+    "desktop": "npm run build && electron .",
     "desktop:dev": "electron . --dev"
   },
   "dependencies": {

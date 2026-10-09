@@ -15,9 +15,14 @@ if (!ipcMain) {
 }
 
 // 本地图片协议：jinmo-file://local/?p=<encodeURIComponent(路径)>
-// 必须在 app ready 之前声明
+// 界面资源协议：jinmo-app://local/<dist 内相对路径>
+// 两者都必须在 app ready 之前声明
 protocol.registerSchemesAsPrivileged([
   { scheme: 'jinmo-file', privileges: { standard: true, secure: true, supportFetchAPI: true } },
+  {
+    scheme: 'jinmo-app',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
 ]);
 
 /** 当前打开文件所在目录，用于解析文档里的相对图片路径 */
@@ -50,17 +55,55 @@ function handleLocalImage(request) {
   }
 }
 
+/** dist/ 目录与它的 MIME 表，供 jinmo-app:// 协议读取界面资源 */
+const DIST_DIR = path.join(__dirname, '..', 'dist');
+const ASSET_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+};
+
+/**
+ * 从 dist/ 取界面资源。
+ *
+ * 走自定义协议而不是 `file://`：`file://` 下 ES module 会被 CORS 拦掉，
+ * 之前只能把整个应用压成一个 HTML 来绕开；而压成单文件会连 Mermaid / MathJax
+ * 的按需加载一起压掉。自定义协议给产物一个正常源，分包与动态 import 都照常工作。
+ */
+function handleAppAsset(request) {
+  const rel = decodeURIComponent(new URL(request.url).pathname).replace(/^[/\\]+/, '');
+  const abs = path.resolve(DIST_DIR, rel === '' ? 'index.html' : rel);
+  if (abs !== DIST_DIR && !abs.startsWith(DIST_DIR + path.sep)) {
+    return new Response('', { status: 403 });
+  }
+  try {
+    const data = fs.readFileSync(abs);
+    return new Response(data, {
+      headers: { 'content-type': ASSET_MIME[path.extname(abs).toLowerCase()] ?? 'application/octet-stream' },
+    });
+  } catch {
+    return new Response('', { status: 404 });
+  }
+}
+
 // 数据目录（窗口状态、最近文件、Chromium 缓存）：默认跟随系统；
 // 设置 JINMO_DATA_DIR 可指到其他盘。必须在 app ready 之前调用。
 if (process.env.JINMO_DATA_DIR) {
   app.setPath('userData', path.resolve(process.env.JINMO_DATA_DIR));
 }
 
-/** 开发模式加载 Vite 开发服务器，否则加载单文件构建产物 */
+/** 开发模式加载 Vite 开发服务器，否则加载构建产物（经 jinmo-app:// 协议） */
 const DEV = process.argv.includes('--dev');
 const SELFTEST = process.argv.includes('--selftest');
 const DEV_URL = 'http://localhost:5173';
-const PROD_HTML = path.join(__dirname, '..', 'dist', 'markdown-editor.html');
+const PROD_URL = 'jinmo-app://local/index.html';
 
 /** `--open <文件>`：启动后直接打开该文件 */
 const OPEN_ARG = (() => {
@@ -325,7 +368,7 @@ function createWindow() {
   if (DEV) {
     win.loadURL(DEV_URL);
   } else {
-    win.loadFile(PROD_HTML);
+    win.loadURL(PROD_URL);
   }
 
   win.webContents.once('did-finish-load', () => {
@@ -334,6 +377,13 @@ function createWindow() {
 
   // 自检：启动后截图存到 temp/ 再退出，用于无人值守验证
   if (SELFTEST) {
+    // 资源加载失败、脚本报错都只在控制台里，白屏时这是唯一的线索
+    win.webContents.on('console-message', (_e, level, message, line, source) => {
+      if (level >= 2) console.log(`SELFTEST_CONSOLE ${source}:${line} ${message}`);
+    });
+    win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+      console.log(`SELFTEST_FAIL_LOAD ${code} ${desc} ${url}`);
+    });
     win.webContents.once('did-finish-load', async () => {
       await new Promise((r) => setTimeout(r, 2500));
       // 报告每个 <img> 的加载结果，便于无人值守判断相对路径 / 绝对路径 / 缺图三种情况
@@ -346,6 +396,15 @@ function createWindow() {
          }))`,
       );
       console.log('SELFTEST_IMAGES ' + JSON.stringify(imgs));
+      // 界面是否真的挂上去了：root 没子节点就是白屏，截图像素再少也不如这个判断直接
+      const dom = await win.webContents.executeJavaScript(
+        `({
+           rootChildren: document.getElementById('root')?.childElementCount ?? -1,
+           lines: document.querySelectorAll('.md-line').length,
+         })`,
+      );
+      console.log('SELFTEST_DOM ' + JSON.stringify(dom));
+      if (dom.rootChildren <= 0) console.log('SELFTEST_BLANK root 未挂载任何内容');
       const image = await win.capturePage();
       const out = path.join(__dirname, '..', 'temp', 'desktop-selftest.png');
       fs.mkdirSync(path.dirname(out), { recursive: true });
@@ -418,6 +477,7 @@ ipcMain.on('dirty:set', (_e, v) => {
 
 app.whenReady().then(() => {
   protocol.handle('jinmo-file', handleLocalImage);
+  protocol.handle('jinmo-app', handleAppAsset);
   createWindow();
 });
 

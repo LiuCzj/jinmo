@@ -16,6 +16,7 @@ const edit = require('./build/md-editing.js');
 const cmd = require('./build/md-commands.js');
 const hl = require('./build/md-highlight.js');
 const code = require('./build/md-code.js');
+const langs = require('./build/code-langs.js');
 
 let passed = 0;
 let failed = 0;
@@ -144,12 +145,27 @@ it('tableCellRanges: 首尾竖线可选，尾随空格不算一格', () => {
   assert.strictEqual(cmd.countTableColumns('| a | b |'), 2);
 });
 
-it('makeTableSnippet: 列数行数正确（含表头与分隔行）', () => {
-  const s = cmd.makeTableSnippet(3, 4);
-  const lines = s.split('\n');
-  assert.strictEqual(lines.length, 4);
+it('makeTableSnippet: 行数含表头行，分隔行不算行', () => {
+  const lines = cmd.makeTableSnippet(3, 4).split('\n');
+  // 4 行 = 表头 + 分隔 + 2 个数据行
+  assert.strictEqual(lines.length, 5);
   assert.strictEqual(lines[0], '|  |  |  |');
   assert.strictEqual(lines[1], '| --- | --- | --- |');
+  assert.strictEqual(lines[4], '|  |  |  |');
+});
+
+it('makeTableSnippet: 最少 1 行 1 列（只有表头也能成表）', () => {
+  const lines = cmd.makeTableSnippet(1, 1).split('\n');
+  assert.strictEqual(lines.length, 2);
+  assert.strictEqual(lines[0], '|  |');
+  assert.strictEqual(lines[1], '| --- |');
+});
+
+it('makeTableSnippet: 列数决定每行单元格数', () => {
+  for (const c of [1, 2, 5, 8]) {
+    const lines = cmd.makeTableSnippet(c, 3).split('\n');
+    for (const l of lines) assert.strictEqual(cmd.tableCellRanges(l).length, c);
+  }
 });
 
 it('tableInsertRow(below): 在表头上插行要落到分隔行之后', () => {
@@ -442,6 +458,122 @@ it('classifyLine: 闭围栏也认成 fence，否则后面整篇会被误判成�
 it('classifyLine: 四个反引号的围栏不被内层三个反引号闭合', () => {
   assert.strictEqual(inline.classifyLine('```', '````').type, 'code');
   assert.strictEqual(inline.classifyLine('````', '````').type, 'fence');
+});
+
+console.log('\n[新增] 插入块（表格 / 代码块）的落点');
+
+it('insertBlock: 空文档里原地填入，不垫空行', () => {
+  const r = cmd.insertBlock('', 0, '| a |\n| --- |', 'below');
+  assert.strictEqual(r.text, '| a |\n| --- |');
+  assert.strictEqual(r.caret, 2, '光标应落在第一格内容处');
+});
+
+it('insertBlock: 光标在空行上时原地填入', () => {
+  const text = '第一段\n\n第三段';
+  const r = cmd.insertBlock(text, 4, '| a |\n| --- |', 'below');
+  assert.strictEqual(r.text, '第一段\n| a |\n| --- |\n第三段');
+});
+
+it('insertBlock: 非空行下方插入，中间留一个空行', () => {
+  const text = '第一段\n第二段';
+  const r = cmd.insertBlock(text, 0, '| a |\n| --- |', 'below');
+  assert.strictEqual(r.text, '第一段\n\n| a |\n| --- |\n第二段');
+});
+
+it('insertBlock: 非空行上方插入，中间留一个空行', () => {
+  const text = '第一段\n第二段';
+  const r = cmd.insertBlock(text, 4, '| a |\n| --- |', 'above');
+  assert.strictEqual(r.text, '第一段\n| a |\n| --- |\n\n第二段');
+});
+
+it('insertBlock: 代码块片段的光标落在开围栏之后', () => {
+  const r = cmd.insertBlock('', 0, '```\n\n```', 'below');
+  assert.strictEqual(r.text, '```\n\n```');
+  assert.strictEqual(r.caret, 4, '光标应落在开围栏那一行的换行之后');
+});
+
+console.log('\n[新增] 代码块语言匹配');
+
+it('语言表 141 条，且不去重', () => {
+  assert.strictEqual(langs.CODE_LANG_HINTS.length, 141);
+  assert.ok(langs.CODE_LANG_HINTS.includes('js') && langs.CODE_LANG_HINTS.includes('javascript'));
+  assert.ok(langs.CODE_LANG_HINTS.includes('c++') && langs.CODE_LANG_HINTS.includes('cpp'));
+});
+
+it('matchLangs: 前缀匹配优先，命中不足 4 条时补子串匹配', () => {
+  // 「py」前缀只命中 python 一条 → 不足 4 条 → 再补子串，但没有任何语言含 py 且不在开头
+  assert.deepStrictEqual(langs.matchLangs('py'), ['python']);
+  // 「java」前缀命中 java / javascript 两条
+  assert.deepStrictEqual(langs.matchLangs('java'), ['java', 'javascript']);
+});
+
+it('matchLangs: 唯一命中且与输入完全相同时不提示', () => {
+  assert.deepStrictEqual(langs.matchLangs('json'), []);
+  assert.deepStrictEqual(langs.matchLangs('python'), []);
+});
+
+it('matchLangs: 前缀命中 ≥4 条时不再补子串', () => {
+  const r = langs.matchLangs('c');
+  assert.ok(r.length >= 4);
+  assert.ok(r.every((l) => l.toLowerCase().startsWith('c')), '不应该混进子串命中：' + r.join(','));
+});
+
+it('matchLangs: 空输入返回全部（排序后）', () => {
+  const r = langs.matchLangs('');
+  assert.strictEqual(r.length, 141);
+  const sorted = [...r].sort();
+  assert.deepStrictEqual(r, sorted);
+});
+
+it('matchLangs: 大小写不敏感（但「完全一致」的判定区分大小写）', () => {
+  assert.deepStrictEqual(langs.matchLangs('PY'), ['python']);
+  // 输入 Python 仍会提示 python —— 相等判定用的 `n[0] === e` 区分大小写
+  assert.deepStrictEqual(langs.matchLangs('Python'), ['python']);
+  assert.deepStrictEqual(langs.matchLangs('python'), []);
+});
+
+it('parseFenceOptions: 认 {.numberLines} 与 startFrom="N"', () => {
+  assert.deepStrictEqual(langs.parseFenceOptions('{.numberLines}'), { lineNumbers: true });
+  assert.deepStrictEqual(langs.parseFenceOptions('{startFrom="5"}'), { firstLineNumber: 5 });
+  assert.deepStrictEqual(langs.parseFenceOptions('{.numberLines startFrom="5"}'), {
+    lineNumbers: true,
+    firstLineNumber: 5,
+  });
+  // 语言与属性写在一起也要认（只在 info string 里任意位置找 {...}，有意放宽）
+  assert.deepStrictEqual(langs.parseFenceOptions('python {.numberLines}'), { lineNumbers: true });
+  assert.deepStrictEqual(langs.parseFenceOptions('python {.numberLines startFrom="5"}'), {
+    lineNumbers: true,
+    firstLineNumber: 5,
+  });
+  // 没有 {...} 就什么都不认
+  assert.deepStrictEqual(langs.parseFenceOptions('python'), {});
+  assert.deepStrictEqual(langs.parseFenceOptions(''), {});
+});
+
+it('fenceLangOf: 从 info string 里取语言词', () => {
+  assert.strictEqual(langs.fenceLangOf('python'), 'python');
+  assert.strictEqual(langs.fenceLangOf('Python'), 'python');
+  assert.strictEqual(langs.fenceLangOf('.lang-python'), 'python');
+  assert.strictEqual(langs.fenceLangOf('lang-python'), 'python');
+  assert.strictEqual(langs.fenceLangOf('{.numberLines}'), '', '纯属性串不该被当成语言');
+  assert.strictEqual(langs.fenceLangOf('python {.numberLines}'), 'python');
+});
+
+it('buildFenceLine: 语言紧贴围栏，属性块前留一个空格', () => {
+  assert.strictEqual(langs.buildFenceLine('', '```', 'python', ''), '```python');
+  assert.strictEqual(langs.buildFenceLine('', '```', '', '{.numberLines}'), '```{.numberLines}');
+  assert.strictEqual(
+    langs.buildFenceLine('', '```', 'python', '{.numberLines startFrom="5"}'),
+    '```python {.numberLines startFrom="5"}',
+  );
+  assert.strictEqual(langs.buildFenceLine('  ', '````', 'js', ''), '  ````js');
+});
+
+it('fenceAttrs: 行号属性块', () => {
+  assert.strictEqual(langs.fenceAttrs(true), '{.numberLines}');
+  assert.strictEqual(langs.fenceAttrs(true, 5), '{.numberLines startFrom="5"}');
+  assert.strictEqual(langs.fenceAttrs(false), '');
+  assert.strictEqual(langs.fenceAttrs(false, 5), '{startFrom="5"}');
 });
 
 console.log('\n──────────────────────────────');

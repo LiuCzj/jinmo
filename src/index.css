@@ -201,11 +201,78 @@
 
   /* 代码块：连续若干行共用一块灰底，靠负外边距让底色比正文宽出一点 */
   .md-code-line {
+    position: relative;
     background-color: hsl(0 0% 97%);
+    border-left: 1px solid hsl(0 0% 91%);
+    border-right: 1px solid hsl(0 0% 91%);
     padding-right: 8px;
     padding-left: 8px;
-    margin-right: -8px;
-    margin-left: -8px;
+    /* 左右各 9px = 8px 内边距 + 1px 边框，正文才能和段落文字对齐 */
+    margin-right: -9px;
+    margin-left: -9px;
+    /*
+     * pre-wrap：保留所有空白（含前导空格与 tab），同时允许长行折行。
+     *
+     * 默认的 `normal` 会把前导空格在视觉上压成 0 —— 这才是「粘贴后缩进没了」的真正原因。
+     * 不用 `pre`：那样长代码行会横向溢出、把整页撑宽。
+     */
+    white-space: pre-wrap;
+  }
+
+  /*
+   * 代码块的首行 / 末行。
+   * 数值：`margin:15px 0;padding:8px 0 6px;border:1px solid #e7eaed;border-radius:3px`。
+   */
+  .md-code-first {
+    border-top: 1px solid hsl(0 0% 91%);
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+    margin-top: 15px;
+    padding-top: 8px;
+  }
+  .md-code-last {
+    border-bottom: 1px solid hsl(0 0% 91%);
+    border-bottom-left-radius: 3px;
+    border-bottom-right-radius: 3px;
+    margin-bottom: 15px;
+    padding-bottom: 6px;
+  }
+
+  /*
+   * 代码行号槽位。
+   * 数值：`padding:0 3px 0 5px;text-align:right;color:#999`，与正文之间 1px #ddd 分隔线。
+   */
+  .md-code-lineno {
+    display: inline-block;
+    min-width: 2.2em;
+    padding: 0 3px 0 5px;
+    margin-right: 10px;
+    border-right: 1px solid hsl(0 0% 87%);
+    text-align: right;
+    color: hsl(0 0% 60%);
+    user-select: none;
+  }
+
+  /*
+   * 代码块右上角的语言标签（点开选语言）。
+   * 挂在开围栏那一行里绝对定位到块右侧，默认半透明，鼠标进到这一行才完全显形。
+   */
+  .md-lang-btn {
+    position: absolute;
+    top: 1px;
+    right: 10px;
+    padding: 0 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    line-height: 16px;
+    color: hsl(215 16% 47%);
+    background-color: hsl(0 0% 100% / 0.72);
+    opacity: 0.45;
+    transition: opacity 0.15s;
+  }
+  .md-code-line:hover .md-lang-btn,
+  .md-lang-btn:focus-visible {
+    opacity: 1;
   }
 
   /* 表格斑马纹：分隔行是 display:none 但仍计入 nth-child，

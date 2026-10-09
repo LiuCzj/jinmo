@@ -50,8 +50,11 @@ import {
   ArrowLeftToLine,
   ArrowRightToLine,
   AlignLeft,
+  Sigma,
+  Search,
 } from 'lucide-react';
 import type { ContextInfo } from '@/lib/md-commands';
+import { matchLangs, PLAIN_LANG_LABEL, MAX_LANG_HINTS } from '@/lib/code-langs';
 
 /** 一条可执行的编辑命令 */
 export interface MdCommand {
@@ -87,8 +90,8 @@ export interface MdSubmenu {
 }
 
 /**
- * 一排图标按钮。Typora 把「加粗/斜体/删除线/行内代码/高亮/链接」收成这样，
- * 六个文字项压成一排，省下五行高度。
+ * 一排图标按钮。把「加粗/斜体/删除线/行内代码/高亮/链接」收成一排，
+ * 六个文字项压成一行，省下五行高度。
  */
 export interface MdIconRow {
   icons: MdCommand[];
@@ -237,21 +240,30 @@ export function ContextMenu({
     /**
      * 滚动 / 滚轮 / 窗口失焦都要关掉：菜单是 `fixed` 定位的，页面一滚它就钉在原地、跟内容脱节。
      * `pointerdown` 用捕获阶段：比冒泡阶段的 mousedown 更不容易被中途拦掉。
+     *
+     * 但**发生在菜单自己身上**的滚动/滚轮不算「页面动了」：菜单可以比视口高（`overflow-y-auto`），
+     * 语言列表就有 28 项。不排除的话滚一下就把菜单关了，等于没法用。
      */
-    const onScroll = () => onClose();
+    const inMenu = (t: EventTarget | null) =>
+      t instanceof Element && !!t.closest('[role="menu"]');
+    const onScroll = (e: Event) => {
+      if (inMenu(e.target)) return;
+      onClose();
+    };
+    const onDismiss = () => onClose();
     document.addEventListener('pointerdown', onDown, true);
     document.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, { capture: true, passive: true });
     window.addEventListener('wheel', onScroll, { passive: true });
-    window.addEventListener('resize', onScroll, { passive: true });
-    window.addEventListener('blur', onScroll);
+    window.addEventListener('resize', onDismiss, { passive: true });
+    window.addEventListener('blur', onDismiss);
     return () => {
       document.removeEventListener('pointerdown', onDown, true);
       document.removeEventListener('keydown', onKey);
       window.removeEventListener('scroll', onScroll, { capture: true });
       window.removeEventListener('wheel', onScroll);
-      window.removeEventListener('resize', onScroll);
-      window.removeEventListener('blur', onScroll);
+      window.removeEventListener('resize', onDismiss);
+      window.removeEventListener('blur', onDismiss);
     };
   }, [onClose]);
 
@@ -408,7 +420,7 @@ export function TableInsertDialog({
   onCancel: () => void;
 }) {
   const [cols, setCols] = useState('3');
-  const [rows, setRows] = useState('4');
+  const [rows, setRows] = useState('3');
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -418,10 +430,11 @@ export function TableInsertDialog({
     return () => document.removeEventListener('keydown', onKey);
   }, [onCancel]);
 
-  /** 把输入夹到合法范围；填了非法值时退回默认值 */
+  /** 把输入夹到合法范围；空值或非数字才退回默认值 */
   const clampNum = (v: string, min: number, max: number, dflt: number) => {
     const n = Math.floor(Number(v));
-    return Number.isFinite(n) && n >= min ? Math.min(max, n) : dflt;
+    if (!Number.isFinite(n)) return dflt;
+    return Math.max(min, Math.min(max, n));
   };
 
   const INPUT =
@@ -462,19 +475,174 @@ export function TableInsertDialog({
             />
           </label>
         </div>
-        <p className="mt-2 text-[11px] text-muted-foreground">行数含表头与分隔行（最少 2 行）</p>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          行数含表头行（分隔行不算行）；表格必须有表头，最少 1 行 1 列
+        </p>
         <div className="mt-4 flex justify-end gap-2">
           <button type="button" onClick={onCancel} className="btn-soft">
             取消
           </button>
           <button
             type="button"
-            onClick={() => onConfirm(clampNum(cols, 1, 12, 3), clampNum(rows, 2, 50, 4))}
+            onClick={() => onConfirm(clampNum(cols, 1, 12, 3), clampNum(rows, 1, 50, 3))}
             className="btn-primary"
           >
             确定
           </button>
         </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+export function LangPicker({
+  pos,
+  current,
+  onPick,
+  onClose,
+}: {
+  pos: { x: number; y: number };
+  /** 当前代码块已有的语言；用来把那一项标出来 */
+  current: string;
+  onPick: (lang: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [hi, setHi] = useState(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  /**
+   * 候选列表 = matchLangs 的匹配结果。
+   * 空输入时在最前面补一条「纯文本」，用来把语言清掉（等价于清空输入，但更容易发现）。
+   */
+  const matched = matchLangs(query);
+  const list: { id: string; label: string }[] = [
+    ...(query === '' ? [{ id: '', label: PLAIN_LANG_LABEL }] : []),
+    ...matched.slice(0, MAX_LANG_HINTS).map((l) => ({ id: l, label: l })),
+  ];
+
+  const w = 240;
+  const maxH = 300;
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1024;
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 768;
+  const x = Math.min(Math.max(4, pos.x), Math.max(4, vw - w - 4));
+  const y = pos.y + maxH + 4 > vh ? Math.max(4, pos.y - maxH - 8) : pos.y + 4;
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    setHi(0);
+  }, [query]);
+
+  // 键盘上下移动时把选中项滚进视野
+  useEffect(() => {
+    const el = listRef.current?.querySelectorAll('[data-lang-li]')[hi] as HTMLElement | undefined;
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [hi, list.length]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setHi((h) => Math.min(h + 1, Math.max(0, list.length - 1)));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setHi((h) => Math.max(h - 1, 0));
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const pick = list[hi];
+        if (pick) onPick(pick.id);
+        else if (query === '') onPick('');
+      }
+    };
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Element | null;
+      if (t?.closest?.('[data-lang-picker]')) return;
+      onClose();
+    };
+    /**
+     * 滚轮 / 滚动发生在面板自己身上不算「页面动了」——
+     * 语言列表可以滚，滚一下就关没法用（和 ContextMenu 同一条规则）。
+     */
+    const onScroll = (e: Event) => {
+      if (e.target instanceof Element && e.target.closest('[data-lang-picker]')) return;
+      onClose();
+    };
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+    window.addEventListener('wheel', onScroll, { passive: true });
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('scroll', onScroll, { capture: true });
+      window.removeEventListener('wheel', onScroll);
+    };
+  }, [list, hi, query, onPick, onClose]);
+
+  return createPortal(
+    <div
+      data-lang-picker=""
+      role="listbox"
+      aria-label="选择代码块语言"
+      style={{ left: x, top: y, width: w }}
+      className="fixed z-[320] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
+    >
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <Search size={14} className="text-muted-foreground" aria-hidden="true" />
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="选择语言"
+          aria-label="搜索语言"
+          className="w-full bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
+        />
+        <span className="shrink-0 text-[11px] text-muted-foreground">{list.length}</span>
+      </div>
+      <div
+        ref={listRef}
+        data-lang-picker-list=""
+        className="max-h-[264px] overflow-y-auto py-1"
+        style={{ maxHeight: maxH - 36 }}
+      >
+        {list.length === 0 && (
+          <div className="px-3 py-2 text-sm text-muted-foreground" data-lang-picker="">
+            无匹配
+          </div>
+        )}
+        {list.map((lang, i) => (
+          <button
+            key={lang.id || '__plain__'}
+            type="button"
+            data-lang-li={i}
+            data-lang-picker=""
+            onMouseEnter={() => setHi(i)}
+            onClick={() => onPick(lang.id)}
+            className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors ${
+              i === hi ? 'bg-foreground/[0.06]' : 'hover:bg-foreground/[0.06]'
+            }`}
+          >
+            <span className="flex-1 font-mono text-[13px] text-foreground">{lang.label}</span>
+            {lang.id !== '' && lang.id === current && (
+              <span className="text-[11px] text-accent">当前</span>
+            )}
+          </button>
+        ))}
       </div>
     </div>,
     document.body,
@@ -511,7 +679,7 @@ export const BLOCK_COMMANDS: MdCommand[] = [
 ];
 
 /**
- * 剪贴板组：剪切 / 复制 / 粘贴。放在菜单最上方，与 Typora 的分组顺序一致。
+ * 剪贴板组：剪切 / 复制 / 粘贴。放在菜单最上方。
  *
  * @returns 三条剪贴板命令
  */
@@ -524,12 +692,12 @@ export function clipboardGroup(): MdMenuItem[] {
 }
 
 /**
- * 删除当前块。
+ * 删除当前块。文案即「删除」。
  *
  * @returns 一条删除命令
  */
 export function deleteGroup(): MdMenuItem[] {
-  return [{ id: 'delete-block', label: '删除这一段', icon: Trash2 }];
+  return [{ id: 'delete-block', label: '删除', icon: Trash2 }];
 }
 
 /**
@@ -561,7 +729,62 @@ function paragraphSubmenu(ctx: ContextInfo): MdSubmenu {
 }
 
 /**
- * `插入 ▸` 子菜单：图片 / 表格 / 代码块 / 分割线 / 列表 / 引用。
+ * 代码块的语言候选。顺序按常用度排，不按字母序。
+ *
+ * 空 id 表示「纯文本」，对应去掉围栏上的 info string。
+ * 这里只列语言名；能不能着色由 `lib/md-code.ts` 决定，选了不支持的语言不影响渲染，只是不着色。
+ */
+export const CODE_LANGS: { id: string; label: string }[] = [
+  { id: '', label: '纯文本' },
+  { id: 'javascript', label: 'JavaScript' },
+  { id: 'typescript', label: 'TypeScript' },
+  { id: 'python', label: 'Python' },
+  { id: 'go', label: 'Go' },
+  { id: 'rust', label: 'Rust' },
+  { id: 'java', label: 'Java' },
+  { id: 'c', label: 'C' },
+  { id: 'cpp', label: 'C++' },
+  { id: 'csharp', label: 'C#' },
+  { id: 'json', label: 'JSON' },
+  { id: 'yaml', label: 'YAML' },
+  { id: 'toml', label: 'TOML' },
+  { id: 'xml', label: 'XML' },
+  { id: 'html', label: 'HTML' },
+  { id: 'css', label: 'CSS' },
+  { id: 'scss', label: 'SCSS' },
+  { id: 'sql', label: 'SQL' },
+  { id: 'shell', label: 'Shell' },
+  { id: 'powershell', label: 'PowerShell' },
+  { id: 'php', label: 'PHP' },
+  { id: 'ruby', label: 'Ruby' },
+  { id: 'swift', label: 'Swift' },
+  { id: 'kotlin', label: 'Kotlin' },
+  { id: 'markdown', label: 'Markdown' },
+  { id: 'mermaid', label: 'Mermaid' },
+  { id: 'diff', label: 'Diff' },
+  { id: 'latex', label: 'LaTeX' },
+];
+
+/**
+ * 代码块的语言选择菜单。
+ *
+ * 命令 id 编码成 `lang:<行号>:<语言>`：菜单本身不携带上下文，
+ * 行号写进 id 后由 runCommand 解析，免得再给菜单状态加字段。
+ *
+ * @param lineIndex 代码块开围栏那一行的行号
+ * @returns 菜单条目
+ */
+export function buildLangMenu(lineIndex: number): MdMenuItem[] {
+  return CODE_LANGS.map((l) => ({ id: `lang:${lineIndex}:${l.id}`, label: l.label, icon: Code2 }));
+}
+
+/**
+ * `插入 ▸` 子菜单。
+ *
+ * 条目顺序：图像 / ── / 脚注 / 链接引用 / 水平分割线 / 表格 /
+ * 代码块 / 公式块 / 内容目录 / YAML Front Matter / ── / 段落（上方）/ 段落（下方）。
+ *
+ * 列表与引用不在这组，收在 `段落 ▸` 里。
  *
  * @returns 子菜单条目
  */
@@ -570,22 +793,25 @@ function insertSubmenu(): MdSubmenu {
     label: '插入',
     icon: Plus,
     items: [
-      { id: 'image', label: '图片', icon: ImageIcon },
+      { id: 'image', label: '图像', icon: ImageIcon },
+      { separator: true },
+      { id: 'footnote', label: '脚注', icon: Type },
+      { id: 'linkref', label: '链接引用', icon: LinkIcon },
+      { id: 'hr', label: '水平分割线', icon: Minus },
       { id: 'table', label: '表格', icon: Table },
       { id: 'codeblock', label: '代码块', icon: Code2 },
-      { id: 'hr', label: '分割线', icon: Minus },
+      { id: 'mathblock', label: '公式块', icon: Sigma },
+      { id: 'toc', label: '内容目录', icon: List },
+      { id: 'yaml', label: 'YAML Front Matter', icon: AlignLeft },
       { separator: true },
-      { id: 'bullet', label: '无序列表', icon: List },
-      { id: 'ordered', label: '有序列表', icon: ListOrdered },
-      { id: 'todo', label: '待办项', icon: ListChecks },
-      { id: 'quote', label: '引用', icon: Quote },
+      { id: 'p-before', label: '段落（上方）', icon: ArrowUpToLine },
+      { id: 'p-after', label: '段落（下方）', icon: ArrowDownToLine },
     ],
   };
 }
 
 /**
- * 表格组：按 Typora 的表格右键菜单分组（官方文档 + 本机实测一致）。
- * 顺序：上方/下方插入行 → 左侧/右侧插入列 → 删除行/删除列 → 复制表格/格式化表格源码 → 删除表格。
+ * 表格组的分组顺序：上方/下方插入行 → 左侧/右侧插入列 → 删除行/删除列 → 复制表格/格式化表格源码 → 删除表格。
  *
  * @returns 表格操作条目
  */
@@ -608,6 +834,17 @@ export function tableGroup(): MdMenuItem[] {
 }
 
 /**
+ * `表格 ▸` 子菜单。
+ *
+ * 表格操作收在子菜单里，不在主菜单平铺 —— 平铺会把主菜单撑到视口外。
+ *
+ * @returns 子菜单条目
+ */
+export function tableSubmenu(): MdSubmenu {
+  return { label: '表格', icon: Table, items: tableGroup() };
+}
+
+/**
  * 按光标上下文生成右键菜单项。
  *
  * 结构要短：行内格式收成一排图标、标题与插入收进子菜单。
@@ -618,7 +855,10 @@ export function tableGroup(): MdMenuItem[] {
  * （默认关）
  * @returns 菜单条目（含分隔线 / 子菜单 / 图标行）
  */
-export function buildContextMenu(ctx: ContextInfo, opts: { extended?: boolean } = {}): MdMenuItem[] {
+export function buildContextMenu(
+  ctx: ContextInfo,
+  opts: { extended?: boolean; codeLineNumbers?: boolean } = {},
+): MdMenuItem[] {
   const items: MdMenuItem[] = [];
 
   if (opts.extended) {
@@ -631,11 +871,24 @@ export function buildContextMenu(ctx: ContextInfo, opts: { extended?: boolean } 
 
   items.push(...clipboardGroup());
 
-  // ── 代码块里：不给行内格式与段落，只给「跳出 / 复制内容」 ──
+  // ── 代码块里：跳出 / 行号 / 复制内容，外加段落与插入 ──
   if (ctx.code) {
     items.push({ separator: true });
     items.push({ id: 'code-exit', label: '在下方跳出代码块', icon: Code2 });
+    items.push({
+      id: 'code-lineno',
+      label: opts.codeLineNumbers ? '隐藏行号' : '显示行号',
+      icon: ListOrdered,
+      active: !!opts.codeLineNumbers,
+    });
     items.push({ id: 'code-copy', label: '复制代码块内容', icon: Copy });
+    items.push({ separator: true });
+    /*
+     * 段落 / 插入 在代码块里也必须有 —— 少了它们，光标在代码块里时就插不了表格、代码块，
+     * 只能先「跳出」再重新右键，两段代码挨在一起时根本分不清谁是谁。
+     */
+    items.push(paragraphSubmenu(ctx));
+    items.push(insertSubmenu());
     items.push({ separator: true });
     items.push(...deleteGroup());
     return items;
@@ -651,15 +904,10 @@ export function buildContextMenu(ctx: ContextInfo, opts: { extended?: boolean } 
     items.push({ id: 'select-all', label: '全选', icon: TextSelect, hint: 'Ctrl+A' });
   }
 
-  // ── 表格里：完整表格操作（扩展菜单）/ 两个常用项（旧菜单） ──
+  // ── 表格里：完整表格操作收进「表格 ▸」 ──
   if (ctx.table) {
     items.push({ separator: true });
-    if (opts.extended) {
-      items.push(...tableGroup());
-    } else {
-      items.push({ id: 'table-row', label: '在下方加一行', icon: Table, hint: 'Ctrl+Enter' });
-      items.push({ id: 'table-col', label: '在右侧加一列', icon: Table });
-    }
+    items.push(tableSubmenu());
   }
 
   items.push({ separator: true });

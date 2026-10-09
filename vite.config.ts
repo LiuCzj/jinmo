@@ -21,4 +21,12 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  build: {
+    /**
+     * 默认的 500KB 提示线对这种包没有意义：Mermaid 的布局引擎 elk 单个就有 1.4MB，
+     * 但它是**按需加载**的独立 chunk —— 只有文档里真的出现 ```mermaid 才会去取。
+     * 主包（index-*.js）只有 230KB 左右。
+     */
+    chunkSizeWarningLimit: 1600,
+  },
 });
