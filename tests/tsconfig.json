@@ -8,5 +8,6 @@
     "strict": true,
     "types": []
   },
-  "include": ["../src/lib/**/*.ts"]
+  "include": ["../src/lib/**/*.ts"],
+  "exclude": ["../src/lib/platform.ts"]
 }

@@ -12,6 +12,12 @@ export interface DesktopApi {
   saveFile(content: string, filePath: string | null): Promise<{ path: string } | null>;
   recentFiles(): Promise<string[]>;
   clearRecent(): Promise<string[]>;
+  /** 弹选图对话框（可多选）；取消时返回空数组 */
+  pickImages(): Promise<string[]>;
+  /** 读系统剪贴板文本；读不到时返回空串 */
+  readClipboard(): Promise<string>;
+  /** 写系统剪贴板文本 */
+  writeClipboard(text: string): Promise<boolean>;
   setTitle(title: string): Promise<void>;
   /** 上报「有未保存改动」，桌面壳关窗前据此提示保存 */
   setDirty(v: boolean): void;

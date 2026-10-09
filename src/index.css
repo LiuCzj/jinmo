@@ -243,14 +243,30 @@
 
   /*
    * 代码行号槽位。
-   * 数值：`padding:0 3px 0 5px;text-align:right;color:#999`，与正文之间 1px #ddd 分隔线。
+   * 数值：数字区 `min-width:2.2em;padding:0 3px 0 5px;text-align:right;color:#999`，
+   * 与正文之间 1px #ddd 分隔线，正文再往右 10px。
+   *
+   * 用绝对定位而不是 inline-block：inline-block 的高度只有一个行盒，
+   * `border-right` 画出的竖线也就只够一行。代码行 `pre-wrap` 折行时，
+   * 第二行文字回到行盒左边缘 —— 会出现在竖线**左边**（用户报的「超出行号那条线」）。
+   * 改成绝对定位 + `top/bottom:0` 后，竖线随整个行盒长高，折几行就画几行。
+   *
+   * @param --lineno-w 行号区总宽（数字 + 左内边距 + 右侧留白），
+   *        代码行的 `padding-left` 必须等于它，否则文字会盖住行号。
    */
+  .md-code-line:has(> .md-code-lineno) {
+    --lineno-w: calc(2.2em + 8px + 10px);
+    padding-left: var(--lineno-w);
+  }
   .md-code-lineno {
-    display: inline-block;
-    min-width: 2.2em;
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: calc(2.2em + 8px);
     padding: 0 3px 0 5px;
-    margin-right: 10px;
     border-right: 1px solid hsl(0 0% 87%);
+    box-sizing: content-box;
     text-align: right;
     color: hsl(0 0% 60%);
     user-select: none;
@@ -276,6 +292,63 @@
   .md-code-line:hover .md-lang-btn,
   .md-lang-btn:focus-visible {
     opacity: 1;
+  }
+
+  /*
+   * 表格：用真 table 布局（照 github.css，没有 `table-layout: fixed`、单元格不设宽度），
+   * 列宽由 `table-layout: auto` 按内容算 —— 短列窄、长列宽，而不是每列等分。
+   *
+   * 表头与数据行分属不同 <div>，无法共用一个 table 元素，只能用 CSS 的表格显示值
+   * 让它们进入同一个匿名表格框，才能对齐成一张表。
+   */
+  .md-table-row {
+    display: table-row;
+  }
+
+  .md-table-row > [data-cell] {
+    display: table-cell;
+    vertical-align: top;
+  }
+
+  /* 整张表包在一个 inline-table 的匿名框里：宽度随内容收缩，不会撑满版心 */
+  .md-table-block {
+    display: table;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 0.8em 0;
+    border-collapse: collapse;
+  }
+
+  /*
+   * 空行：0.8em 段落间距，不是一整行高。
+   *
+   * 必须把**行盒**压掉 —— 行内那个 `<span class="h-[0.8em]">` 只是撑内容，
+   * 行本身的 strut 仍按 line-height 占一整行（约 28px），
+   * 于是两块代码块之间会多出一条 40px 以上的空白。
+   *
+   * 注意兄弟选择器要用 `.md-fences` 而不是 `.md-code-line`：
+   * `.md-fences` 是**包裹容器**，代码行是它的子节点 —— 空行的兄弟是容器，
+   * 不是带 `.md-code-line` 的行，用后者永远匹配不上（实测 matches() = false）。
+   */
+  .md-line:has(> span.h-\[0\.8em\]) {
+    line-height: 0;
+    height: 0.8em;
+  }
+
+  /*
+   * 夹在两块代码块之间的那条空行整条去掉：代码块有边框/底色会形成 BFC，
+   * 上下 15px 外距不合并，这条空行会实打实占位，两块看起来像黏在一起。
+   *
+   * 类名由 renderBlocks 在成对代码块中间的那条空行上打（见 md-gap-line）。
+   * 纯 CSS 做不到：`:has()` 只能向后看，判断「前一个兄弟是 .md-fences」
+   * 需要额外一次 `:has()`，而把条件串成 `.md-fences + .md-line + .md-fences`
+   * 时 `display:none` 会落到末尾的 `.md-fences` 上，把第二个代码块整块隐藏（踩过）。
+   *
+   * 块**末尾**的空行不能删 —— 它是光标逃出代码块的唯一落点。
+   */
+  .md-gap-line {
+    display: none;
   }
 
   /* 表格斑马纹：分隔行是 display:none 但仍计入 nth-child，

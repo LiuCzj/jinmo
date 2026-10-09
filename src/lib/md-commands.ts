@@ -365,6 +365,20 @@ export function tableAddColumn(text: string): { text: string; caret: number } | 
 }
 
 /**
+ * 判断块插入后是否需要在末尾补一个空行，让光标能落到块外面。
+ *
+ * 代码块 / 公式块的「内部」会被编辑器吞掉光标拾取：块是最后一行时，
+ * 点块下方根本没有行元素可点，光标被永久关在块里。
+ * 补一个空行后，块下方永远存在一个块外行。
+ *
+ * @param snippet 要插入的块内容
+ * @returns 需要补空行时为 true
+ */
+export function needsTrailingBlank(snippet: string): boolean {
+  return snippet.startsWith('```') || snippet.startsWith('$$');
+}
+
+/**
  * 在光标所在行的上方或下方插入一个块（表格、代码块、引用等），不替换原有行。
  * 当前行是空行时直接原地填入。
  *
@@ -381,21 +395,23 @@ export function insertBlock(
   where: 'above' | 'below' = 'below',
 ): EditResult {
   const { start, end } = lineBoundsAt(text, caret);
+  // 代码块/公式块后面补空行，否则光标无处可逃（详见 needsTrailingBlank）
+  const tail = needsTrailingBlank(snippet) ? '\n' : '';
 
   // 当前行为空行时原地填入。空文档里必须走这条：否则会先垫出两个空行，
   // 表格看起来像是被插到了文末而不是光标处。
   if (text.slice(start, end).trim() === '') {
-    const next = text.slice(0, start) + snippet + text.slice(end);
+    const next = text.slice(0, start) + snippet + tail + text.slice(end);
     return { text: next, caret: start + snippetInnerOffset(snippet) };
   }
 
   // 非空行的上下另起一段，中间留一个空行：紧贴上一段时表格会被当成段落的一部分
   if (where === 'above') {
-    const next = text.slice(0, start) + snippet + '\n\n' + text.slice(start);
+    const next = text.slice(0, start) + snippet + tail + '\n\n' + text.slice(start);
     return { text: next, caret: start + snippetInnerOffset(snippet) };
   }
 
-  const next = text.slice(0, end) + '\n\n' + snippet + text.slice(end);
+  const next = text.slice(0, end) + '\n\n' + snippet + tail + text.slice(end);
   return { text: next, caret: end + 2 + snippetInnerOffset(snippet) };
 }
 

@@ -53,6 +53,8 @@ import {
   Sigma,
   Search,
   IndentIncrease,
+  Indent,
+  Outdent,
 } from 'lucide-react';
 import { INDENT_SIZE_CHOICES, type ContextInfo } from '@/lib/md-commands';
 import { matchLangs, PLAIN_LANG_LABEL, MAX_LANG_HINTS } from '@/lib/code-langs';
@@ -339,7 +341,7 @@ export function ContextMenu({
         {items.map((item, i) => {
           if (isSeparator(item)) return <div key={`sep-${i}`} className="my-1 border-t border-border" />;
 
-          // 一排图标按钮（行内格式）
+          // 一排图标按钮（行内格式 / 块级包裹 / 缩进）
           if (isIconRow(item)) {
             return (
               <div key={`row-${i}`} className="flex items-center gap-0.5 px-2 py-1">
@@ -350,8 +352,13 @@ export function ContextMenu({
                     role="menuitem"
                     title={c.hint ? `${c.label}（${c.hint}）` : c.label}
                     aria-label={c.label}
+                    aria-pressed={c.active ? true : undefined}
                     onClick={() => onRun(c.id)}
-                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+                    className={`flex size-7 items-center justify-center rounded-md transition-colors ${
+                      c.active
+                        ? 'bg-accent/12 text-accent'
+                        : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
+                    }`}
                   >
                     <c.icon size={15} aria-hidden="true" />
                   </button>
@@ -401,6 +408,93 @@ export function ContextMenu({
         </div>
       )}
     </>,
+    document.body,
+  );
+}
+
+// ── 单行文本输入对话框 ────────────────────────────────────
+
+/**
+ * 自绘的单行输入框，替代 `window.prompt`。
+ *
+ * 桌面壳（Electron）不实现 `window.prompt`，网页版里它又会阻塞渲染线程，
+ * 两条路都不能用，必须自绘。
+ *
+ * @param props.title 标题
+ * @param props.label 输入框上方的说明
+ * @param props.initial 初始值
+ * @param props.placeholder 占位文字
+ * @param props.onConfirm 确定（返回去掉首尾空白的文本）
+ * @param props.onCancel 取消（点遮罩、Esc、取消按钮）
+ */
+export function PromptDialog({
+  title,
+  label,
+  initial = '',
+  placeholder,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  label?: string;
+  initial?: string;
+  placeholder?: string;
+  onConfirm: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const [v, setV] = useState(initial);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  /** 空值不提交 —— 空的地址 / 空的替代文字没有意义 */
+  const submit = () => {
+    const t = v.trim();
+    if (!t) return;
+    onConfirm(t);
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[320] flex items-start justify-center bg-foreground/20 pt-[18vh]"
+      onMouseDown={onCancel}
+    >
+      <div
+        role="dialog"
+        aria-label={title}
+        className="w-[420px] rounded-lg border border-border bg-card p-4 shadow-2xl"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <p className="mb-3 text-sm font-bold text-foreground">{title}</p>
+        {label && <p className="mb-1.5 text-xs text-muted-foreground">{label}</p>}
+        <input
+          autoFocus
+          value={v}
+          placeholder={placeholder}
+          onChange={(e) => setV(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm text-foreground outline-none focus:border-ring"
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button" onClick={onCancel} className="btn-soft">
+            取消
+          </button>
+          <button type="button" onClick={submit} className="btn-primary">
+            确定
+          </button>
+        </div>
+      </div>
+    </div>,
     document.body,
   );
 }
@@ -652,14 +746,36 @@ export function LangPicker({
 
 // ── 命令表 ────────────────────────────────────────────────
 
-/** 行内格式（气泡用） */
+/** 行内格式（气泡用，也是右键菜单第一排按钮） */
 export const INLINE_COMMANDS: MdCommand[] = [
   { id: 'bold', label: '加粗', icon: Bold, hint: 'Ctrl+B' },
   { id: 'italic', label: '斜体', icon: Italic, hint: 'Ctrl+I' },
-  { id: 'strike', label: '删除线', icon: Strikethrough },
   { id: 'code', label: '行内代码', icon: Code, hint: 'Ctrl+`' },
-  { id: 'highlight', label: '高亮', icon: Highlighter },
   { id: 'link', label: '链接', icon: Link2, hint: 'Ctrl+K' },
+];
+
+/**
+ * 块级包裹那一排按钮：引用 / 有序 / 无序 / 待办。
+ *
+ * 这四项原本埋在 `段落 ▸` 子菜单里，要钻两层才点得到；
+ * 提成一排直接点，跟行内格式一样一眼可见。
+ *
+ * @param ctx 光标上下文，用来给已生效的那项打高亮
+ * @returns 一排按钮命令
+ */
+export function blockWrapCommands(ctx: ContextInfo): MdCommand[] {
+  return [
+    { id: 'quote', label: '引用', icon: Quote, active: ctx.quote },
+    { id: 'ordered', label: '有序列表', icon: ListOrdered, active: ctx.list },
+    { id: 'bullet', label: '无序列表', icon: List, active: ctx.list },
+    { id: 'todo', label: '待办项', icon: ListChecks },
+  ];
+}
+
+/** 缩进那一排按钮 */
+export const INDENT_COMMANDS: MdCommand[] = [
+  { id: 'outdent', label: '减少缩进', icon: Outdent, hint: 'Ctrl+[' },
+  { id: 'indent', label: '增加缩进', icon: Indent, hint: 'Ctrl+]' },
 ];
 
 /** 块级插入（菜单用） */
@@ -702,7 +818,10 @@ export function deleteGroup(): MdMenuItem[] {
 }
 
 /**
- * `段落 ▸` 子菜单：标题档位 + 列表 / 引用 / 正文。
+ * `段落 ▸` 子菜单：只留标题档位与「正文」。
+ *
+ * 引用 / 有序 / 无序 / 待办已提到主菜单那一排按钮上，这里不再重复，
+ * 免得同一个命令两个入口、用户分不清哪个是「正牌」。
  *
  * @param ctx 光标上下文（用来给当前生效的那一项打高亮）
  * @returns 子菜单条目
@@ -718,11 +837,6 @@ function paragraphSubmenu(ctx: ContextInfo): MdSubmenu {
       { id: 'h4', label: '四级标题', icon: Heading4, active: ctx.headingLevel === 4 },
       { id: 'h5', label: '五级标题', icon: Heading5, active: ctx.headingLevel === 5 },
       { id: 'h6', label: '六级标题', icon: Heading6, active: ctx.headingLevel === 6 },
-      { separator: true },
-      { id: 'quote', label: '引用', icon: Quote, active: ctx.quote },
-      { id: 'bullet', label: '无序列表', icon: List, active: ctx.list },
-      { id: 'ordered', label: '有序列表', icon: ListOrdered, active: ctx.list },
-      { id: 'todo', label: '待办项', icon: ListChecks },
       { separator: true },
       { id: 'normal', label: '正文', icon: Type, active: !ctx.quote && !ctx.list && !ctx.heading },
     ],
@@ -935,9 +1049,12 @@ export function buildContextMenu(
     return items;
   }
 
-  // ── 行内格式：一排图标，六个文字项压成一行 ──
+  // ── 行内格式 + 块级包裹 + 缩进：三排按钮，一眼可见、一点即生效 ──
+  // 这些操作原本要钻 `段落 ▸` 两层子菜单才点得到，是「没实用性」观感的来源。
   items.push({ separator: true });
   items.push({ icons: INLINE_COMMANDS });
+  items.push({ icons: blockWrapCommands(ctx) });
+  items.push({ icons: INDENT_COMMANDS });
 
   if (opts.extended) {
     items.push({ separator: true });

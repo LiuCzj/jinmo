@@ -1,7 +1,7 @@
 {
   "name": "jinmo",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "所见即所得的 Markdown 编辑器：语法随光标浮现，纯前端，可发布为网页或打包成桌面应用",
   "license": "AGPL-3.0-or-later",

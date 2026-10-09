@@ -19,6 +19,15 @@ contextBridge.exposeInMainWorld('desktop', {
   recentFiles: () => ipcRenderer.invoke('file:recent'),
   clearRecent: () => ipcRenderer.invoke('file:clear-recent'),
 
+  /** 弹选图对话框（可多选）→ 绝对路径数组；取消时为空数组 */
+  pickImages: () => ipcRenderer.invoke('image:pick'),
+
+  /** 读系统剪贴板文本 → string；读不到时为空串 */
+  readClipboard: () => ipcRenderer.invoke('clipboard:read'),
+
+  /** 写系统剪贴板文本 */
+  writeClipboard: (text) => ipcRenderer.invoke('clipboard:write', text),
+
   /** 设置窗口标题 */
   setTitle: (title) => ipcRenderer.invoke('title:set', title),
 

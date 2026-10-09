@@ -4,7 +4,7 @@
  * 使用 CommonJS 而非 TypeScript：这是独立于渲染层的薄壳，省掉一套编译步骤。
  */
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, shell, clipboard } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -111,8 +111,10 @@ const OPEN_ARG = (() => {
   return i >= 0 ? process.argv[i + 1] : null;
 })();
 
-// 自检常在无 GPU 的环境里跑，关掉硬件加速并放宽沙箱，否则 GPU 进程崩溃会拖垮整个应用
-if (SELFTEST) {
+// 自检与远程调试（CDP 验证）常在无 GPU 的环境里跑，关掉硬件加速并放宽沙箱，
+// 否则 GPU 进程崩溃会拖垮整个应用（本机表现：GPU process isn't usable. Goodbye.）
+const REMOTE_DEBUG = process.argv.some((a) => a.startsWith('--remote-debugging-port'));
+if (SELFTEST || REMOTE_DEBUG) {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('disable-gpu');
@@ -467,6 +469,31 @@ ipcMain.handle('file:clear-recent', () => {
   buildMenu();
   return [];
 });
+
+// ── 选图片 / 系统剪贴板（渲染进程无权限，必须走主进程） ──
+
+const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'bmp', 'svg', 'tiff', 'tif', 'webp', 'gif'];
+
+ipcMain.handle('image:pick', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    title: '插入图片',
+    filters: [
+      { name: '图片', extensions: IMAGE_EXTS },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+    properties: ['openFile', 'multiSelections'],
+  });
+  return canceled ? [] : filePaths;
+});
+
+// Electron 默认不实现 window.prompt，剪贴板读取也默认被拒；
+// 这两个能力只能由主进程代劳，渲染进程通过 preload 暴露的方法调用。
+ipcMain.handle('clipboard:read', () => clipboard.readText());
+ipcMain.handle('clipboard:write', (_e, text) => {
+  clipboard.writeText(String(text ?? ''));
+  return true;
+});
+
 ipcMain.handle('title:set', (_e, title) => win?.setTitle(title));
 // 渲染进程上报是否有未保存改动，关窗前用它决定要不要提示
 ipcMain.on('dirty:set', (_e, v) => {

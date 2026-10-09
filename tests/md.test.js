@@ -310,6 +310,47 @@ it('revealSegAt: 图片 → 整段按源码原样（可见文本与源码不逐�
   );
 });
 
+it('revealSegAt: 任务片段 → 露出 `[ ] ` 源码（不复用复选框渲染态）', () => {
+  // buildLines 造出的真实片段：task 覆盖 `[ ] `，raw 与 src 等长
+  const src = '- [ ] 待办';
+  const segs = [
+    { text: '[ ] ', srcStart: 2, rawStart: 2, rawEnd: 6, kind: 'task', checked: false },
+    { text: '待办', srcStart: 6, rawStart: 6, rawEnd: 8, kind: 'plain' },
+  ];
+  const out = inline.revealSegAt(segs, src, 3);
+  // 关键：kind 必须变成 plain，否则 renderSegs 还会画复选框、源码模式看不出区别
+  assert.strictEqual(out[0].kind, 'plain', '任务片段应展开成 plain 才能显示原文');
+  assert.strictEqual(out[0].text, '[ ] ');
+  assert.deepStrictEqual(
+    out.map((s) => s.kind),
+    ['plain', 'plain'],
+  );
+});
+
+it('revealSegAt: 任务片段等长是唯一特例 —— 提前 return 会把它打回，必须排在它前面', () => {
+  // 这是一个回归用例：曾经把 task 分支写在「可见文本与源码等长 → return segs」之后，
+  // 于是永远执行不到，任务行在源码模式下看不出 `[ ] ` 原文。
+  const src = '- [x] 完成';
+  const segs = [
+    { text: '[x] ', srcStart: 2, rawStart: 2, rawEnd: 6, kind: 'task', checked: true },
+    { text: '完成', srcStart: 6, rawStart: 6, rawEnd: 8, kind: 'plain' },
+  ];
+  const out = inline.revealSegAt(segs, src, 4);
+  assert.notStrictEqual(out, segs, '不能原样返回（那说明被提前 return 拦下了）');
+  assert.strictEqual(out[0].kind, 'plain');
+});
+
+it('revealSegAt: 光标不在任务片段上时不受影响', () => {
+  const src = '- [ ] 待办';
+  const segs = [
+    { text: '[ ] ', srcStart: 2, rawStart: 2, rawEnd: 6, kind: 'task', checked: false },
+    { text: '待办', srcStart: 6, rawStart: 6, rawEnd: 8, kind: 'plain' },
+  ];
+  // col=0 落在 `- ` 上（前缀不在 segs 里，findIndex 会命中第一个 raw 区间不覆盖 0 的片段）
+  const out = inline.revealSegAt(segs, src, 7);
+  assert.strictEqual(out[0].kind, 'task', '光标在正文上时复选框照旧');
+});
+
 console.log('\n[新增] 源码模式着色');
 
 it('highlightMarkdown: HTML 特殊字符被转义', () => {
@@ -488,8 +529,28 @@ it('insertBlock: 非空行上方插入，中间留一个空行', () => {
 
 it('insertBlock: 代码块片段的光标落在开围栏之后', () => {
   const r = cmd.insertBlock('', 0, '```\n\n```', 'below');
-  assert.strictEqual(r.text, '```\n\n```');
+  assert.strictEqual(r.text, '```\n\n```\n', '代码块末尾补一个空行');
   assert.strictEqual(r.caret, 4, '光标应落在开围栏那一行的换行之后');
+});
+
+it('insertBlock: 代码块/公式块末尾补空行，让光标能落到块外', () => {
+  // 空文档
+  assert.strictEqual(cmd.insertBlock('', 0, '```\n\n```', 'below').text, '```\n\n```\n');
+  // 非空行下方
+  assert.strictEqual(cmd.insertBlock('A', 0, '```\n\n```', 'below').text, 'A\n\n```\n\n```\n');
+  // 非空行上方：块后仍要有一个空行与原文分开
+  assert.strictEqual(cmd.insertBlock('A', 0, '```\n\n```', 'above').text, '```\n\n```\n\n\nA');
+  // 公式块同样处理
+  assert.strictEqual(cmd.insertBlock('', 0, '$$\n\n$$', 'below').text, '$$\n\n$$\n');
+  // 表格不补（表格不是会把光标关起来的容器）
+  assert.strictEqual(cmd.insertBlock('', 0, '| a |\n| --- |', 'below').text, '| a |\n| --- |');
+});
+
+it('needsTrailingBlank: 只认代码块与公式块', () => {
+  assert.strictEqual(cmd.needsTrailingBlank('```js\nx\n```'), true);
+  assert.strictEqual(cmd.needsTrailingBlank('$$\nx$$'), true);
+  assert.strictEqual(cmd.needsTrailingBlank('| a |\n| --- |'), false);
+  assert.strictEqual(cmd.needsTrailingBlank('> 引用'), false);
 });
 
 console.log('\n[新增] 代码块语言匹配');

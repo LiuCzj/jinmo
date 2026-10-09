@@ -503,6 +503,27 @@ export function revealSegAt(segs: InlineSeg[], src: string, col: number): Inline
   const idx = segs.findIndex((s) => col >= s.rawStart && col <= s.rawEnd);
   if (idx === -1) return segs;
   const s = segs[idx];
+
+  /*
+   * 任务片段（`[ ] ` / `[x] `）必须先处理，且**必须排在下面那句提前 return 之前**。
+   *
+   * 它的可见文本就是源码本身（rawStart === srcStart、rawEnd === srcStart + text.length），
+   * 正好满足「可见文本与源码等长 → 无需展开」的条件而被提前打回；
+   * 于是光标落上去时 `- [ ] ` 露不出来（任务行在源码模式下看着跟渲染态一样）。
+   * 这与图片（`🖼` 占位）同属「可见文本 ≠ 源码」的一类，只是它恰好等长。
+   */
+  if (s.kind === 'task') {
+    const out = [...segs];
+    out[idx] = {
+      text: src.slice(s.rawStart, s.rawEnd),
+      srcStart: s.rawStart,
+      rawStart: s.rawStart,
+      rawEnd: s.rawEnd,
+      kind: 'plain',
+    };
+    return out;
+  }
+
   if (s.rawStart === s.srcStart && s.rawEnd === s.srcStart + s.text.length) return segs;
 
   const out = [...segs];
