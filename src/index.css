@@ -276,6 +276,18 @@
    * 代码块右上角的语言标签（点开选语言）。
    * 挂在开围栏那一行里绝对定位到块右侧，默认半透明，鼠标进到这一行才完全显形。
    */
+  /*
+   * 围栏行不显示时压成 0 高。
+   *
+   * 代码块的外框由 `.md-fences` 的 `padding: 8px 0 6px` 撑开，
+   * 围栏自己不该再占一行的高度（参考实现里围栏是看不见的）。
+   */
+  .md-fence-ghost {
+    display: block;
+    height: 0;
+    overflow: hidden;
+  }
+
   .md-lang-btn {
     position: absolute;
     top: 1px;
@@ -289,7 +301,14 @@
     opacity: 0.45;
     transition: opacity 0.15s;
   }
-  .md-code-line:hover .md-lang-btn,
+  /*
+   * 悬停**整块代码块**就把语言标签点亮。
+   *
+   * ⚠️ 不能写 `.md-code-line:hover .md-lang-btn` —— 语言按钮挂在**围栏行**上
+   * （`.md-line`），不是 `.md-code-line` 的后代，那个选择器永远匹配不上（实测踩过）。
+   * 而且围栏行现在高度是 0，也没法单独悬停它。
+   */
+  .md-fences:hover .md-lang-btn,
   .md-lang-btn:focus-visible {
     opacity: 1;
   }
@@ -434,6 +453,26 @@
     text-align: center;
   }
 
+  /* 块级公式真正居中的那一刀。
+     ⚠️ 上面那句 `text-align: center` 其实**不管用**：Tailwind Preflight 把 `svg`
+     设成了 `display: block`，而 `text-align` 只管**行内**内容 ——
+     块级的 SVG 照样贴着左边。这就是长期挂着的"块级公式未居中"的真正原因。
+     块级元素要居中只能用 `margin: 0 auto`。 */
+  .md-math-block .md-math mjx-container > svg {
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  /* 块级公式真正居中的那一刀。
+     ⚠️ 上面那句 `text-align: center` 其实**不管用**：Tailwind Preflight 把 `svg`
+     设成了 `display: block`，而 `text-align` 只管**行内**内容 ——
+     块级的 SVG 照样贴着左边。这就是长期挂着的"块级公式未居中"的真正原因。
+     块级元素要居中只能用 `margin: 0 auto`。 */
+  .md-math-block .md-math mjx-container > svg {
+    margin-left: auto;
+    margin-right: auto;
+  }
+
   /* MathJax 的无障碍 MathML 默认可见（它的自带样式表会隐藏，我们没引那份），必须自己藏掉 */
   mjx-assistive-mml {
     position: absolute !important;
@@ -463,19 +502,60 @@
     text-align: center;
   }
 
-  /* ── 代码块着色 ── */
-  .md-code-com {
+  /* ── 代码块着色（highlight.js 的类名）── */
+  .hljs-comment,
+  .hljs-quote {
     color: hsl(215 16% 58%);
     font-style: italic;
   }
-  .md-code-str {
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-type,
+  .hljs-section {
+    color: hsl(271 60% 50%);
+  }
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-addition {
     color: hsl(95 45% 36%);
   }
-  .md-code-num {
+  .hljs-number,
+  .hljs-built_in,
+  .hljs-symbol,
+  .hljs-bullet {
     color: hsl(25 85% 42%);
   }
-  .md-code-kw {
-    color: hsl(271 60% 50%);
+  .hljs-title,
+  .hljs-name,
+  .hljs-function,
+  .hljs-class {
+    color: hsl(221 83% 43%);
+  }
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-variable,
+  .hljs-property,
+  .hljs-template-variable {
+    color: hsl(199 89% 35%);
+  }
+  .hljs-tag,
+  .hljs-selector-id,
+  .hljs-selector-class,
+  .hljs-selector-attr,
+  .hljs-selector-pseudo {
+    color: hsl(150 55% 32%);
+  }
+  .hljs-meta,
+  .hljs-deletion,
+  .hljs-doctag {
+    color: hsl(215 16% 50%);
+  }
+  .hljs-emphasis {
+    font-style: italic;
+  }
+  .hljs-strong {
+    font-weight: 700;
   }
 
   /* ── 源码模式着色 ── */

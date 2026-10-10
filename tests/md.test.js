@@ -114,6 +114,20 @@ it('enter: 空列表项回车 → 退出列表（去掉前缀）', () => {
   assert.strictEqual(r.caret, 0);
 });
 
+it('enter: 代码块里回车只换行，不续列表', () => {
+  // YAML 里的 `      - "8080:80"` 长得像列表项，但它在围栏内，不是 Markdown 结构。
+  // 以前会续上 `- ` 前缀，把代码内容一行行改坏（实测缩进逐行累加）。
+  const t = '```yaml\n      - "8080:80"\n```';
+  const caret = t.indexOf('\n```');
+  const r = edit.enter(t, caret);
+  assert.strictEqual(r.text, '```yaml\n      - "8080:80"\n\n```');
+});
+
+it('enter: 代码块外的同类行仍然续列表', () => {
+  const r = edit.enter('      - "8080:80"', 19);
+  assert.strictEqual(r.text, '      - "8080:80"\n      - ');
+});
+
 it('backspace: 列表行首退格 → 上方插入空项，不删前缀', () => {
   const r = edit.backspace('x\n- a', 2);
   assert.strictEqual(r.text, 'x\n- \n- a');
@@ -378,9 +392,9 @@ console.log('\n[新增] 代码块着色');
 
 it('highlightCode: 关键字 / 字符串 / 注释分别着色', () => {
   const html = code.highlightCode('const a = "hi"; // 注释', 'js');
-  assert.ok(html.includes('md-code-kw'));
-  assert.ok(html.includes('md-code-str'));
-  assert.ok(html.includes('md-code-com'));
+  assert.ok(html.includes('hljs-keyword'));
+  assert.ok(html.includes('hljs-string'));
+  assert.ok(html.includes('hljs-comment'));
 });
 
 it('highlightCode: HTML 特殊字符被转义', () => {
@@ -391,7 +405,7 @@ it('highlightCode: HTML 特殊字符被转义', () => {
 
 it('highlightCode: Python 的 # 注释被识别', () => {
   const html = code.highlightCode('x = 1  # 说明', 'python');
-  assert.ok(html.includes('md-code-com'));
+  assert.ok(html.includes('hljs-comment'));
 });
 
 it('highlightCode: 未知语言不抛错，原文保留', () => {
@@ -707,6 +721,29 @@ it('tableTabTarget: 逆向跳格（Shift+Tab）', () => {
 it('tableTabTarget: 表格末尾再往后跳返回 null', () => {
   const text = '| a | b |\n| --- | --- |\n| c | d |\n';
   assert.strictEqual(cmd.tableTabTarget(text, text.indexOf('d'), 1), null);
+});
+
+it('tableMoveRow: 数据行上移（表头与分隔行不动）', () => {
+  const t = '| h |\n| --- |\n| a |\n| b |';
+  const r = cmd.tableMoveRow(t, t.indexOf('| b |') + 2, 'up');
+  assert.strictEqual(r.text, '| h |\n| --- |\n| b |\n| a |');
+});
+
+it('tableMoveRow: 表头 / 分隔行不能移动', () => {
+  const t = '| h |\n| --- |\n| a |';
+  assert.strictEqual(cmd.tableMoveRow(t, 2, 'up'), null);
+  assert.strictEqual(cmd.tableMoveRow(t, 8, 'up'), null);
+});
+
+it('tableMoveColumn: 左移该列，分隔行的对齐标记跟着列走', () => {
+  const t = '| a | b |\n| --- | ---: |\n| 1 | 2 |';
+  const r = cmd.tableMoveColumn(t, t.indexOf('| 2 |') + 2, 'left');
+  assert.strictEqual(r.text, '| b | a |\n| ---: | --- |\n| 2 | 1 |');
+});
+
+it('tableMoveColumn: 已在最左列时返回 null', () => {
+  const t = '| a | b |\n| --- | --- |';
+  assert.strictEqual(cmd.tableMoveColumn(t, 2, 'left'), null);
 });
 
 it('tableTabTarget: 不在表格里返回 null', () => {

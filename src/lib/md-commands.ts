@@ -683,6 +683,63 @@ export function tableInsertRow(text: string, caret: number, where: 'above' | 'be
  * @param caret 光标位置
  * @returns 新文本与光标；光标不在表格，或行为表头、分隔行时返回 null
  */
+/**
+ * 上移 / 下移当前行。
+ *
+ * 表头（第 0 行）与分隔行（第 1 行）不参与移动 —— 它们一动表格结构就坏了。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param dir `'up'` 上移 / `'down'` 下移
+ * @returns 新文本与光标；光标不在表格里、或在表头/分隔行上、或已到边界时 null
+ */
+export function tableMoveRow(text: string, caret: number, dir: 'up' | 'down'): EditResult | null {
+  const pos = tablePosAt(text, caret);
+  if (!pos) return null;
+  const i = pos.rowIndex;
+  if (i <= 1) return null;
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (j <= 1 || j >= pos.lines.length) return null;
+
+  const nextLines = [...pos.lines];
+  [nextLines[i], nextLines[j]] = [nextLines[j], nextLines[i]];
+  const before = nextLines.slice(0, i).reduce((n, l) => n + l.length + 1, 0);
+  return {
+    text: text.slice(0, pos.blockStart) + rebuildBlock(nextLines) + text.slice(tableBlockRange(pos).to),
+    caret: pos.blockStart + before + 2,
+  };
+}
+
+/**
+ * 左移 / 右移当前列。
+ *
+ * 分隔行也一起换 —— 列对齐标记写在分隔行上，跟着列走才对。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param dir `'left'` 左移 / `'right'` 右移
+ * @returns 新文本与光标；光标不在表格里、或已到边界时 null
+ */
+export function tableMoveColumn(text: string, caret: number, dir: 'left' | 'right'): EditResult | null {
+  const pos = tablePosAt(text, caret);
+  if (!pos) return null;
+  const c = pos.colIndex;
+  const d = dir === 'left' ? c - 1 : c + 1;
+  if (d < 0 || d >= pos.cols) return null;
+
+  const nextLines = pos.lines.map((l) => {
+    const cells = tableCellsOf(l);
+    while (cells.length < pos.cols) cells.push('');
+    [cells[c], cells[d]] = [cells[d], cells[c]];
+    return rowOf(cells);
+  });
+  const before = nextLines.slice(0, pos.rowIndex).reduce((n, l) => n + l.length + 1, 0);
+  return {
+    text: text.slice(0, pos.blockStart) + rebuildBlock(nextLines) + text.slice(tableBlockRange(pos).to),
+    caret: pos.blockStart + before + 2,
+  };
+}
+
 export function tableDeleteRow(text: string, caret: number): EditResult | null {
   const pos = tablePosAt(text, caret);
   if (!pos) return null;
@@ -766,6 +823,66 @@ export function tableFormatSource(text: string, caret: number): EditResult | nul
   return { text: next, caret: pos.blockStart + before + 2 };
 }
 
+/** 列对齐方式：`none` = 不写标记（跟渲染器默认走） */
+export type TableAlign = 'none' | 'left' | 'center' | 'right';
+
+/**
+ * 读分隔行的列对齐标记。
+ *
+ * `:---` 左、`:---:` 居中、`---:` 右、`---` 不指定。
+ *
+ * @param line 分隔行源码（表格块的第 2 行）
+ * @returns 每列的对齐方式；长度 = 该行的列数
+ */
+export function tableAlignmentsOf(line: string): TableAlign[] {
+  return tableCellsOf(line).map((c) => {
+    const left = c.startsWith(':');
+    const right = c.endsWith(':');
+    if (left && right) return 'center';
+    if (left) return 'left';
+    if (right) return 'right';
+    return 'none';
+  });
+}
+
+/**
+ * 给光标所在的那一列设置对齐标记 —— 只改分隔行，其余列原样保留。
+ *
+ * 横线数量保留（不足 3 个补到 3 个）：手敲的宽分隔行不会被压窄。
+ *
+ * @param text 全文
+ * @param caret 光标位置
+ * @param align 目标对齐方式
+ * @returns 新文本与光标；光标不在表格里时 null
+ */
+export function tableSetAlign(text: string, caret: number, align: TableAlign): EditResult | null {
+  const pos = tablePosAt(text, caret);
+  if (!pos || pos.lines.length < 2) return null;
+
+  const aligns = tableAlignmentsOf(pos.lines[1]);
+  while (aligns.length < pos.cols) aligns.push('none');
+  aligns[pos.colIndex] = align;
+
+  const sepCells = tableCellsOf(pos.lines[1]);
+  while (sepCells.length < pos.cols) sepCells.push('---');
+  const nextSep = rowOf(
+    sepCells.map((c, i) => {
+      const dashes = c.replace(/:/g, '') || '---';
+      const d = dashes.length >= 3 ? dashes : '---';
+      const a = aligns[i];
+      if (a === 'center') return `:${d}:`;
+      if (a === 'left') return `:${d}`;
+      if (a === 'right') return `${d}:`;
+      return d;
+    }),
+  );
+
+  const lineStart = pos.lineStarts[1];
+  const next = text.slice(0, lineStart) + nextSep + text.slice(lineStart + pos.lines[1].length);
+  const r = tableCellRanges(nextSep)[pos.colIndex];
+  return { text: next, caret: lineStart + (r ? r.to : nextSep.length) };
+}
+
 /**
  * 删除整张表格（块内所有行，连同其后的一个换行）。
  *
@@ -835,7 +952,18 @@ export function inTable(text: string, caret: number): boolean {
 
 /** 判断光标是否在代码围栏里 */
 export function inCodeFence(text: string, caret: number): boolean {
-  const before = text.slice(0, caret);
+  /**
+   * 判据分两种：
+   *  1. 光标所在行**本身就是围栏行**（` ``` `）→ 一定属于某个代码块（要么开、要么闭）。
+   *  2. 其余行 → 看它**之前**的围栏数，奇数即夹在块内。
+   *
+   * 只按"光标之前"数（旧实现）会漏掉两种情况：光标停在开围栏行的**行首**时之前是 0 个、
+   * 被判成"不在块内"，右键菜单就变成段落菜单；光标停在闭围栏行时又恰好是奇数、
+   * 算对了但换行位置仍有歧义。按行判定才稳。
+   */
+  const { start, end } = lineBoundsAt(text, caret);
+  if (/^\s*(?:```|~~~)/.test(text.slice(start, end))) return true;
+  const before = text.slice(0, start);
   // 统计光标之前出现过的 ``` 数量，奇数即在围栏内
   const fences = before.match(/^\s*(?:```|~~~)/gm);
   return fences !== null && fences.length % 2 === 1;

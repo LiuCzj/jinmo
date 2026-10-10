@@ -59,6 +59,8 @@ import {
   SNIPPETS,
   tableAddColumn,
   tableAddRow,
+  tableAlignmentsOf,
+  tableSetAlign,
   tableBlockRange,
   tableCellRanges,
   tableDelete,
@@ -67,6 +69,8 @@ import {
   tableFormatSource,
   tableInsertColumn,
   tableInsertRow,
+  tableMoveColumn,
+  tableMoveRow,
   tablePosAt,
   tableTabTarget,
   unwrapSelection,
@@ -74,6 +78,7 @@ import {
   type FindHit,
   type InlineTarget,
   type Selection,
+  type TableAlign,
 } from '@/lib/md-commands';
 import {
   buildContextMenu,
@@ -83,11 +88,15 @@ import {
   FormatBubble,
   INLINE_COMMANDS,
   LangPicker,
+  PromptDialog,
+  TableBar,
+  tableGroup,
   TableInsertDialog,
   type FloatPos,
   type MdMenuItem,
 } from './MarkdownFloats';
 import { FindBar, type FindState } from './FindBar';
+import { pickImages, readClipboard, writeClipboard } from '@/lib/platform';
 
 /** 一行的渲染描述 */
 interface RenderLine {
@@ -103,6 +112,8 @@ interface RenderLine {
   prefixText: string;
   /** 表格行的列数（取表头的列数，head/sep/body 三种行都有值） */
   tableCols?: number;
+  /** 表格各列的对齐方式（取自分隔行；三种表格行都有值） */
+  tableAligns?: TableAlign[];
   /** 代码块的语言标识，取自围栏后的第一个词；code 行与 fence 行都有 */
   lang?: string;
   /** 本行是代码块的开围栏（语言选择按钮挂在它上面） */
@@ -461,7 +472,12 @@ function buildLines(src: string, globalLineNumbers = false): RenderLine[] {
             p.mathTex !== l.mathTex ||
             p.diagram !== l.diagram ||
             p.mathBlockFirst !== l.mathBlockFirst ||
-            p.mathBlockLast !== l.mathBlockLast
+            p.mathBlockLast !== l.mathBlockLast ||
+            // 表格的列数 / 列对齐派生自**分隔行**，行自己的 src 没变时也会变。
+            // 不比较就会复用旧对象，表头行一直带着旧的对齐值（改完对齐表头不动，实测踩过）。
+            // 对齐是数组、每次都是新引用，所以按值比。
+            p.tableCols !== l.tableCols ||
+            (p.tableAligns?.join() ?? '') !== (l.tableAligns?.join() ?? '')
           ) {
             return l;
           }
@@ -488,14 +504,25 @@ function markTables(lines: RenderLine[]): void {
     if (!next || next.kind.type !== 'p' || !TABLE_SEP_RE.test(next.src) || !next.src.includes('-')) continue;
 
     const cols = tableCellRanges(l.src).length;
+    // 列对齐写在分隔行上（`:---` / `:---:` / `---:`），三种表格行共用同一份
+    const aligns = tableAlignmentsOf(next.src);
+    if (typeof window !== 'undefined') {
+      (window as unknown as Record<string, unknown>).__dbgAligns = [
+        ...(((window as unknown as Record<string, unknown[]>).__dbgAligns as unknown[]) ?? []),
+        { sep: next.src, aligns },
+      ].slice(-6);
+    }
     l.kind = { type: 'tableHead', prefixLen: 0 };
     l.tableCols = cols;
+    l.tableAligns = aligns;
     next.kind = { type: 'tableSep', prefixLen: 0 };
     next.tableCols = cols;
+    next.tableAligns = aligns;
     for (let j = i + 2; j < lines.length; j++) {
       if (lines[j].kind.type !== 'p' || !lines[j].src.trimStart().startsWith('|')) break;
       lines[j].kind = { type: 'tableBody', prefixLen: 0 };
       lines[j].tableCols = cols;
+      lines[j].tableAligns = aligns;
     }
   }
 }
@@ -653,10 +680,35 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   const [langPicker, setLangPicker] = useState<{ lineIndex: number; pos: FloatPos } | null>(null);
   /** 选区格式气泡的位置；null = 不显示 */
   const [bubble, setBubble] = useState<FloatPos | null>(null);
+  /**
+   * 表格悬浮工具条：`{ pos, at }`。
+   *
+   * `pos` 是浮层坐标（表格左上角上方），`at` 是 hover 命中的那个格子在全文里的下标 ——
+   * 点工具条上的按钮就按这个位置执行，**不去动编辑器里的光标**，
+   * 免得用户正在别处做的事被打断。
+   */
+  const [tableBar, setTableBar] = useState<{ pos: FloatPos; at: number } | null>(null);
+  /** 悬浮条要用最新的 lines 算格子源码区间，而监听器只挂一次 */
+  const linesRef = useRef<RenderLine[]>([]);
+
   /** 「插入表格」对话框是否打开 */
   const [tableAsk, setTableAsk] = useState(false);
   /** 表格对话框打开时记下的插入锚点；null = 用当前光标 */
   const [tableAnchor, setTableAnchor] = useState<number | null>(null);
+  /**
+   * 自绘单行输入框（替代 `window.prompt`）。
+   *
+   * 桌面壳（Electron）不实现 `window.prompt`，点「插入图像」等会毫无反应；
+   * 网页版里它又会阻塞渲染线程。所以统一走这个自绘对话框。
+   * null = 不显示；`onConfirm` 拿到去掉首尾空白的输入值。
+   */
+  const [prompt, setPrompt] = useState<{
+    title: string;
+    label?: string;
+    initial?: string;
+    placeholder?: string;
+    onConfirm: (v: string) => void;
+  } | null>(null);
   /** 状态栏上的一次性提示（如「请按 Ctrl+V」）；用提示条而不是弹窗，不打断操作 */
   const [notice, setNotice] = useState('');
   /** 有文件拖过编辑区时的视觉反馈 */
@@ -1315,6 +1367,8 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         strike: '~~',
         code: '`',
         highlight: '==',
+        // 行内公式 `$x$`：与行内代码同构，一对同字符包裹
+        math: '$',
       };
       if (id === 'link') {
         applyEdit(insertLink(value, sel));
@@ -1472,67 +1526,90 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
                     ? tableInsertColumn(value, caret, 'right')
                     : id === 'table-col-delete'
                       ? tableDeleteColumn(value, caret)
-                      : id === 'table-format'
+                      : id === 'table-row-up'
+                        ? tableMoveRow(value, caret, 'up')
+                        : id === 'table-row-down'
+                          ? tableMoveRow(value, caret, 'down')
+                          : id === 'table-col-move-left'
+                            ? tableMoveColumn(value, caret, 'left')
+                            : id === 'table-col-move-right'
+                              ? tableMoveColumn(value, caret, 'right')
+                              : id === 'table-format'
                         ? tableFormatSource(value, caret)
-                        : id === 'table-delete'
-                          ? tableDelete(value, caret)
-                          : null;
+                        : id === 'table-align-left'
+                          ? tableSetAlign(value, caret, 'left')
+                          : id === 'table-align-center'
+                            ? tableSetAlign(value, caret, 'center')
+                            : id === 'table-align-right'
+                              ? tableSetAlign(value, caret, 'right')
+                              : id === 'table-align-none'
+                                ? tableSetAlign(value, caret, 'none')
+                                : id === 'table-delete'
+                                  ? tableDelete(value, caret)
+                                  : null;
         if (r) applyEdit(r);
         return;
       }
 
-      // ── 剪贴板 ──
+      // ── 剪贴板：走平台层。桌面版由主进程读写（渲染进程的 navigator.clipboard
+      //    在 Electron 里默认被拒），网页版才用浏览器 API ──
       if (id === 'cut' || id === 'copy') {
         const text = value.slice(sel.start, sel.end);
         if (!text) {
           setNotice('先选中要操作的文字');
           return;
         }
-        navigator.clipboard
-          .writeText(text)
-          .then(() => setNotice(id === 'cut' ? '已剪切' : '已复制'))
-          .catch(() => setNotice('浏览器拒绝了剪贴板写入，请用 Ctrl+C / Ctrl+X'));
+        writeClipboard(text).then((ok) =>
+          setNotice(ok ? (id === 'cut' ? '已剪切' : '已复制') : '剪贴板写入被拒，请用 Ctrl+C / Ctrl+X'),
+        );
         if (id === 'cut') {
           applyEdit({ text: value.slice(0, sel.start) + value.slice(sel.end), caret: sel.start });
         }
         return;
       }
       if (id === 'paste') {
-  /**
-   * 主动读剪贴板受浏览器授权限制，存在 granted / prompt / denied 三态；
-   * 被拒时引导用户改按 Ctrl+V（原生 paste 事件无需授权）。
-   */
         const insert = (t: string) => {
           if (!t) return;
           const s = currentSelection();
+          /**
+           * 光标停在**围栏行**上时，把插入点挪进代码块正文。
+           *
+           * 直接插在围栏行里会把 ` ``` ` 撕坏（实测变成 `` ``PASTED` ``，代码块结构没了）。
+           * 开围栏 → 内容成为第一条代码行；闭围栏 → 内容成为最后一条代码行（插在闭围栏上方）。
+           *
+           * 开/闭靠「本行之前的围栏数」判奇偶：偶数=开围栏，奇数=闭围栏。
+           * 不能用 `codeBlockRangeAt` —— 它从光标行往**回**找围栏，光标停在闭围栏上时会找到它自己。
+           */
+          let at = s.start;
+          let end = s.end;
+          let text = t;
+          const all = value.split('\n');
+          const li = lineIndexOf(value, s.start).index;
+          const isFence = (l: string) => /^\s*(?:`{3,}|~{3,})/.test(l);
+          if (li >= 0 && li < all.length && isFence(all[li])) {
+            const before = all.slice(0, li).filter(isFence).length;
+            const targetLine = before % 2 === 0 ? li + 1 : li;
+            if (targetLine < all.length) {
+              let p = 0;
+              for (let i = 0; i < targetLine; i++) p += all[i].length + 1;
+              at = p;
+              end = p;
+              // 目标行本身有内容时补一个换行，别把新内容粘到原代码行上
+              if (all[targetLine] !== '') text = t + '\n';
+            }
+          }
           applyEdit({
-            text: value.slice(0, s.start) + t + value.slice(s.end),
-            caret: s.start + t.length,
+            text: value.slice(0, at) + text + value.slice(end),
+            caret: at + text.length,
           });
         };
-        const guide = (denied: boolean) =>
-          setNotice(
-            denied
-              ? '剪贴板权限被浏览器记住为拒绝 —— 点地址栏图标允许后重试，或直接按 Ctrl+V'
-              : '浏览器拦下了右键粘贴 —— 直接按 Ctrl+V（焦点已就位）',
-          );
-        try {
-          navigator.permissions
-            ?.query({ name: 'clipboard-read' as PermissionName })
-            .then((st) => {
-              if (st.state === 'denied') {
-                guide(true);
-                return undefined;
-              }
-              return navigator.clipboard
-                .readText()
-                .then(insert)
-                .catch(() => guide(false));
-            })
-            .catch(() => guide(false));
-        } catch {
-          guide(false);
-        }
+        readClipboard().then((t) => {
+          if (!t) {
+            setNotice('剪贴板为空或读取被拒 —— 也可直接按 Ctrl+V');
+            return;
+          }
+          insert(t);
+        });
         return;
       }
 
@@ -1562,31 +1639,65 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           return;
         }
         if (id === 'link-replace' || id === 'image-replace') {
-          const newUrl = window.prompt('新的地址（http/https 或图床链接）：', mt.t.href || 'https://');
-          if (!newUrl) return;
-          const syntax = (id === 'image-replace' ? '!' : '') + `[${mt.t.label}](${newUrl})`;
-          applyEdit({
-            text: value.slice(0, absStart) + syntax + value.slice(absEnd),
-            caret: absStart + syntax.length,
+          const isImg = id === 'image-replace';
+          setPrompt({
+            title: isImg ? '修改图片地址' : '修改链接地址',
+            label: '新的地址（http/https 或图床链接）',
+            initial: mt.t.href || 'https://',
+            placeholder: 'https://',
+            onConfirm: (newUrl) => {
+              const syntax = (isImg ? '!' : '') + `[${mt.t.label}](${newUrl})`;
+              applyEdit({
+                text: value.slice(0, absStart) + syntax + value.slice(absEnd),
+                caret: absStart + syntax.length,
+              });
+            },
           });
           return;
         }
         // image-alt
-        const newAlt = window.prompt('替代文字（图片加载失败时显示）：', mt.t.label);
-        if (newAlt === null) return;
-        const syntax = `![${newAlt}](${mt.t.href})`;
-        applyEdit({
-          text: value.slice(0, absStart) + syntax + value.slice(absEnd),
-          caret: absStart + syntax.length,
+        setPrompt({
+          title: '修改替代文字',
+          label: '替代文字（图片加载失败时显示）',
+          initial: mt.t.label,
+          onConfirm: (newAlt) => {
+            const syntax = `![${newAlt}](${mt.t.href})`;
+            applyEdit({
+              text: value.slice(0, absStart) + syntax + value.slice(absEnd),
+              caret: absStart + syntax.length,
+            });
+          },
         });
         return;
       }
 
-      // ── 图片：先问地址（拖拽进来的图片走 M4c 的拖放通道） ──
+      // ── 图片：问地址插入 URL 图片；本地文件走「本地图片…」或直接拖进来 ──
       if (id === 'image') {
-        const src = window.prompt('图片地址（也可以直接把图片文件拖进编辑器）');
-        if (!src) return;
-        applyEdit(insertImage(value, currentSelection(), src));
+        setPrompt({
+          title: '插入图片',
+          label: '图片地址（http/https 或图床链接）',
+          placeholder: 'https://',
+          onConfirm: (src) => {
+            applyEdit(insertImage(value, currentSelection(), src));
+          },
+        });
+        return;
+      }
+
+      // ── 本地图片：弹系统文件选择框（桌面版原生对话框 / 网页版 input[type=file]） ──
+      if (id === 'image-file') {
+        pickImages()
+          .then((srcs) => {
+            if (!srcs.length) return;
+            const s = currentSelection();
+            // 多选时每个文件单独一行 —— 不能塞给 insertImage，那会把整串当同一个地址
+            const snippet = srcs.map((src) => `![](${src})`).join('\n');
+            applyEdit({
+              text: value.slice(0, s.start) + snippet + value.slice(s.end),
+              caret: s.start + snippet.length,
+            });
+          })
+          .catch(() => setNotice('打开图片选择框失败'));
         return;
       }
 
@@ -1717,6 +1828,24 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   );
 
   /**
+   * 右键落点是否应**保留当前选区**。
+   *
+   * 落点判定给一个字符的容差：选区只有两三个字时很窄，右键稍微偏一点就落到相邻字上，
+   * 选区被清掉、接着点「复制」就成了空操作（用户反馈"选中文字后点右键，
+   * 文字已经没处于被选中状态了"）。行自己的 onContextMenu 与编辑区空白处的
+   * onBackgroundContextMenu 必须共用这一份判断 —— 之前后者是无条件清选区的。
+   *
+   * @param pos 右键落点对应的绝对下标
+   * @returns true = 保留选区不动
+   */
+  const keepSelectionFor = (pos: number): boolean => {
+    if (anchor === null || anchor === caret) return false;
+    const from = Math.min(anchor, caret);
+    const to = Math.max(anchor, caret);
+    return pos >= from - 1 && pos <= to + 1;
+  };
+
+  /**
    * 右键：先把光标落到鼠标所在行的对应位置，再按上下文生成菜单。
    * 命中图片或链接语法时生成专用菜单。
    *
@@ -1726,13 +1855,10 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   const onContextMenu = (e: React.MouseEvent, li: number) => {
     e.preventDefault();
     const pos = caretFromPoint(li, e.clientX, e.clientY);
-    const from = anchor === null ? null : Math.min(anchor, caret);
-    const to = anchor === null ? null : Math.max(anchor, caret);
-  /**
-   * 右键点在已有选区内时不动选区，否则复制会得到空内容。
-   */
-    const inside = from !== null && to !== null && pos >= from && pos <= to;
-    if (!inside) {
+    /**
+     * 右键点在已有选区内时不动选区，否则复制会得到空内容。
+     */
+    if (!keepSelectionFor(pos)) {
       setCaret(pos);
       setAnchor(null);
     }
@@ -2521,6 +2647,16 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
    */
   const onBackgroundMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
+    /**
+     * 只处理**真正落在编辑器里**的按下。
+     *
+     * 语言选择器 / 右键菜单 / 各种弹窗都是 `createPortal` 到 `body` 的，
+     * 在 DOM 树里不在编辑器内；但它们在 **React 组件树**里仍是本容器的子节点，
+     * 事件会沿着组件树冒泡到这里 —— 不挡住的话，点选择器的搜索框会被下面那句
+     * `focus()` 把焦点抢回编辑器（实测：点输入框后 `focusin` 直接变成「编辑器输入」，
+     * 用户看到的就是"点一下就乱跳"）。
+     */
+    if (!e.currentTarget.contains(e.target as Node)) return;
     inputRef.current?.focus();
     if ((e.target as HTMLElement).closest('.cursor-text')) return;
     e.preventDefault();
@@ -2550,7 +2686,31 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     const x = sr ? Math.min(Math.max(clientX, sr.left + 1), sr.right - 1) : clientX;
     const hit = document.elementFromPoint(x, clientY) as HTMLElement | null;
     const raw = hit?.closest?.('.md-line')?.getAttribute('data-li');
-    return raw == null ? -1 : Number(raw);
+    if (raw != null) return Number(raw);
+
+    /**
+     * 没命中任何行（点在行内边距、代码块容器的上下内边距、行间空隙上）：
+     * 取**纵向最近**的那一行。
+     *
+     * ⚠️ 不能返回 -1 交给调用方"丢到文末"：代码块容器 `.md-fences` 有 8px/6px 上下内边距，
+     * 点在块内这圈空白上会被判成"不在任何行上"，光标直接飞到文档末尾 ——
+     * 表现就是"想往代码块里粘贴，内容却落到了代码块下面的空白处"（实测踩过）。
+     */
+    let best = -1;
+    let bestDy = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < lineEls.current.length; i++) {
+      const el = lineEls.current[i];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      // 隐藏行（表格分隔行 display:none）尺寸为 0，跳过
+      if (r.width === 0 && r.height === 0) continue;
+      const dy = clientY < r.top ? r.top - clientY : clientY > r.bottom ? clientY - r.bottom : 0;
+      if (dy < bestDy) {
+        bestDy = dy;
+        best = i;
+      }
+    }
+    return best;
   };
 
   /**
@@ -2576,8 +2736,17 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       const fr = first?.getBoundingClientRect();
       pos = fr && e.clientY < fr.top ? 0 : value.length;
     }
-    setCaret(pos);
-    setAnchor(null);
+    /**
+     * 右键落在已有选区内时**不动选区**，否则复制 / 剪切会拿到空内容。
+     *
+     * 与行自己的 `onContextMenu` 共用同一份判断：右键点在行的左右内边距、
+     * 行间空隙、代码块容器的上下内边距上时，事件不会走到行自己的处理器、只走到这里 ——
+     * 这里原来是无条件 `setAnchor(null)`，选区会被清掉。
+     */
+    if (!keepSelectionFor(pos)) {
+      setCaret(pos);
+      setAnchor(null);
+    }
     setBubble(null);
     setMenu({
       pos: { x: e.clientX, y: e.clientY },
@@ -2729,7 +2898,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
    * @param inFence 本行是否在代码块容器内（容器已画边框，行不再自己补边）
    * @returns 行元素
    */
-  const renderLine = (i: number, inFence: boolean) => {
+  const renderLine = (i: number, inFence: boolean, gap = false) => {
     const l = lines[i];
     if (!l) return null;
     return (
@@ -2737,6 +2906,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         key={i}
         line={l}
         index={i}
+        gap={gap}
         editing={isEditingLine(i)}
         mathEditing={
           l.mathBlockFirst !== undefined &&
@@ -2785,7 +2955,23 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             {lines.slice(i, j + 1).map((_, k) => renderLine(i + k, true))}
           </div>,
         );
-        i = j + 1;
+        /**
+         * 夹在**两块代码块之间**的那条空行整条不渲染。
+         *
+         * 代码块有边框 + 底色 ⇒ 形成 BFC ⇒ 上下 15px 外距不合并，
+         * 这条空行会实打实再占 12.8px，两块看起来被硬塞了一道缝。
+         * ⚠️ 块**末尾**那条空行不能动 —— 它是光标逃出代码块的唯一落点。
+         */
+        if (
+          lines[j + 1]?.kind.type === 'blank' &&
+          j + 2 < lines.length &&
+          isCodeLike(lines, j + 2)
+        ) {
+          out.push(renderLine(j + 1, false, true));
+          i = j + 2;
+        } else {
+          i = j + 1;
+        }
       } else {
         out.push(renderLine(i, false));
         i++;
@@ -2793,6 +2979,130 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     }
     return out;
   };
+
+  /** 悬浮条要用最新的 lines 算格子区间，而 mousemove 监听器只挂一次 */
+  linesRef.current = lines;
+
+  /**
+   * 表格悬浮工具条：鼠标停在表格上就浮出来，移开就消失。
+   *
+   * 挂在 document 上而不是给每个表格行加 `onMouseEnter` —— 行组件是 `memo` 的，
+   * 多传一个回调会让所有行都判"变了"，长文档性能会掉。
+   * `mousemove` 用 rAF 节流，避免高频 setState。
+   */
+  useEffect(() => {
+    let raf = 0;
+    /** 隐藏延时：从表格挪到工具条上要经过一小段空白，立刻隐藏就点不到按钮了 */
+    let hideTimer = 0;
+    const isSep = (el: Element) => {
+      const t = (el.textContent || '').trim();
+      return t.includes('|') && /^[\s|:\-]+$/.test(t);
+    };
+
+    const update = (target: Element | null) => {
+      // 鼠标停在工具条自己身上时不要隐藏
+      if (target?.closest?.('[role="toolbar"][aria-label="表格"]')) return;
+      const row = target?.closest?.('.md-table-row') as HTMLElement | null;
+      if (!row) {
+        if (!hideTimer) {
+          hideTimer = window.setTimeout(() => {
+            hideTimer = 0;
+            setTableBar(null);
+          }, 160);
+        }
+        return;
+      }
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = 0;
+      }
+
+      const li = Number(row.getAttribute('data-li'));
+      const line = linesRef.current[li];
+      if (!line) {
+        setTableBar(null);
+        return;
+      }
+      // hover 命中的那个格子；没命中格子（点在行内边距上）就退回第 0 格
+      const cellEl = target?.closest?.('[data-cell]') as HTMLElement | null;
+      const cells = cellEl ? [...(cellEl.parentElement?.querySelectorAll('[data-cell]') ?? [])] : [];
+      const ci = Math.max(0, cells.indexOf(cellEl as HTMLElement));
+      const range = tableCellRanges(line.src)[ci];
+      const at = line.start + (range ? range.from : 0);
+
+      // 整块表格的矩形：同一父容器里连续的「表格行 / 分隔行」
+      const wrap = row.parentElement;
+      if (!wrap) {
+        setTableBar(null);
+        return;
+      }
+      const kids = [...wrap.children];
+      const isTbl = (el: Element) => el.classList.contains('md-table-row') || isSep(el);
+      let a = kids.indexOf(row);
+      let b = a;
+      while (a > 0 && isTbl(kids[a - 1])) a--;
+      while (b + 1 < kids.length && isTbl(kids[b + 1])) b++;
+      const r1 = kids[a].getBoundingClientRect();
+      const r2 = kids[b].getBoundingClientRect();
+      setTableBar({ pos: { x: Math.min(r1.left, r2.left), y: Math.min(r1.top, r2.top) }, at });
+    };
+
+    const onMove = (e: MouseEvent) => {
+      const target = e.target as Element | null;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        update(target);
+      });
+    };
+    const onLeave = () => setTableBar(null);
+    document.addEventListener('mousemove', onMove);
+    document.documentElement.addEventListener('mouseleave', onLeave);
+    return () => {
+      document.removeEventListener('mousemove', onMove);
+      document.documentElement.removeEventListener('mouseleave', onLeave);
+      if (raf) cancelAnimationFrame(raf);
+      if (hideTimer) clearTimeout(hideTimer);
+    };
+  }, []);
+
+  /**
+   * 执行悬浮工具条上的表格命令。
+   *
+   * 用 hover 命中的那个格子的位置（`at`），**不动编辑器光标** ——
+   * 用户可能在别处正做着事，hover 一下就挪光标会很讨厌。
+   *
+   * @param id 命令 id（与右键菜单同一套）
+   * @param at 目标位置（全文下标）
+   */
+  const runTableBar = useCallback(
+    (id: string, at: number) => {
+      const r =
+        id === 'table-row-above'
+          ? tableInsertRow(value, at, 'above')
+          : id === 'table-row-below'
+            ? tableInsertRow(value, at, 'below')
+            : id === 'table-col-left'
+              ? tableInsertColumn(value, at, 'left')
+              : id === 'table-col-right'
+                ? tableInsertColumn(value, at, 'right')
+                : id === 'table-align-left'
+                  ? tableSetAlign(value, at, 'left')
+                  : id === 'table-align-center'
+                    ? tableSetAlign(value, at, 'center')
+                    : id === 'table-align-right'
+                      ? tableSetAlign(value, at, 'right')
+                      : id === 'table-row-delete'
+                        ? tableDeleteRow(value, at)
+                        : id === 'table-col-delete'
+                          ? tableDeleteColumn(value, at)
+                          : id === 'table-delete'
+                            ? tableDelete(value, at)
+                            : null;
+      if (r) applyEdit(r);
+    },
+    [value, applyEdit],
+  );
 
   return (
     <div
@@ -2984,6 +3294,19 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           }}
         />
       )}
+      {tableBar && (
+        <TableBar
+          pos={tableBar.pos}
+          onRun={(id) => runTableBar(id, tableBar.at)}
+          /**
+           * 「更多操作」打开完整表格菜单（与右键「表格 ▸」同一份条目）。
+           * 菜单挂在悬浮条下方一点，别盖住工具条本身。
+           */
+          onMore={() =>
+            setMenu({ pos: { x: tableBar.pos.x, y: tableBar.pos.y + 34 }, items: tableGroup(), target: null })
+          }
+        />
+      )}
       {menu && <ContextMenu pos={menu.pos} items={menu.items} onRun={runCommand} onClose={() => setMenu(null)} />}
       {langPicker && (
         <LangPicker
@@ -2992,16 +3315,41 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           onPick={(id) => {
             setCodeLang(langPicker.lineIndex, id);
             setLangPicker(null);
+            /**
+             * 选完必须把焦点还给编辑器的隐藏输入框。
+             *
+             * 选择器里那个搜索框拿走了焦点，选择器一卸载焦点就落回 `<body>` ——
+             * 此时直接打字/粘贴会**全部丢失**（实测：选完语言后连打 5 行代码，一个字都没进去）。
+             * `onClose` 不加这句：那种情况用户是点了别处，抢焦点反而会把光标拽走。
+             */
+            inputRef.current?.focus();
           }}
           onClose={() => setLangPicker(null)}
         />
       )}
       {bubble && (
         <FormatBubble
+          // 位置变化时强制重挂：Radix 只在「打开 / 滚动 / 尺寸变化」时重算定位，
+          // 单纯换一个坐标 prop 不会让它挪窝，气泡就会钉在第一次的位置上。
+          key={`${bubble.x},${bubble.y}`}
           pos={bubble}
           commands={INLINE_COMMANDS}
           onRun={runCommand}
           onClose={() => setBubble(null)}
+        />
+      )}
+      {prompt && (
+        <PromptDialog
+          title={prompt.title}
+          label={prompt.label}
+          initial={prompt.initial}
+          placeholder={prompt.placeholder}
+          onConfirm={(v) => {
+            const run = prompt.onConfirm;
+            setPrompt(null);
+            run(v);
+          }}
+          onCancel={() => setPrompt(null)}
         />
       )}
     </div>
@@ -3215,6 +3563,8 @@ interface EditorLineProps {
   preedit: string;
   /** 本行内的查找命中（行内列号）；没有命中时是同一个空数组引用 */
   lineHits: { start: number; end: number }[];
+  /** 夹在两块代码块之间的空行 —— 整条不渲染（见 CSS 的 `.md-gap-line`） */
+  gap?: boolean;
   onLineClick: (li: number, e: React.MouseEvent) => void;
   onLineMouseDown: (li: number, e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent, li: number) => void;
@@ -3247,6 +3597,7 @@ function linePropsEqual(a: EditorLineProps, b: EditorLineProps): boolean {
       x.codeFence !== y.codeFence ||
       x.codeNo !== y.codeNo ||
       x.tableCols !== y.tableCols ||
+      x.tableAligns !== y.tableAligns ||
       x.mathTex !== y.mathTex ||
       x.diagram !== y.diagram ||
       x.mathBlockFirst !== y.mathBlockFirst ||
@@ -3267,7 +3618,8 @@ function linePropsEqual(a: EditorLineProps, b: EditorLineProps): boolean {
     a.selEnd === b.selEnd &&
     a.caretCol === b.caretCol &&
     a.preedit === b.preedit &&
-    a.lineHits === b.lineHits
+    a.lineHits === b.lineHits &&
+    a.gap === b.gap
   );
 }
 
@@ -3291,6 +3643,7 @@ const EditorLine = memo(function EditorLine({
   caretCol,
   preedit,
   lineHits,
+  gap,
   onLineClick,
   onLineMouseDown,
   onContextMenu,
@@ -3309,7 +3662,7 @@ const EditorLine = memo(function EditorLine({
       onClick={(e) => onLineClick(i, e)}
       onMouseDown={(e) => onLineMouseDown(i, e)}
       onContextMenu={(e) => onContextMenu(e, i)}
-      className={`md-line cursor-text transition-opacity duration-200 ${dimmed ? 'opacity-25' : ''} ${
+      className={`md-line cursor-text transition-opacity duration-200 ${gap ? 'md-gap-line' : ''} ${dimmed ? 'opacity-25' : ''} ${
         l.kind.type === 'code' || l.kind.type === 'fence'
           ? `md-code-line${isCodeFirst ? ' md-code-first' : ''}${isCodeLast ? ' md-code-last' : ''}`
           : ''
@@ -3317,14 +3670,11 @@ const EditorLine = memo(function EditorLine({
         l.kind.type === 'tableSep'
           ? 'hidden'
           : isTableRow
-            ? `md-table-row grid border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
+            ? `md-table-row border-border border-l border-r border-t ${isTableLast ? 'border-b' : ''} ${
                 l.kind.type === 'tableHead' ? 'font-bold' : ''
               }`
             : (LINE_CLS[l.kind.type] ?? '')
       }`}
-      style={
-        isTableRow ? { gridTemplateColumns: `repeat(${l.tableCols ?? 1}, minmax(0, 1fr))` } : undefined
-      }
     >
       {/*
         代码行号槽位（padding 0 3px 0 5px / text-align right / color #999，右侧 1px #ddd 分隔线）。
@@ -3352,7 +3702,19 @@ const EditorLine = memo(function EditorLine({
         <span className="inline-block h-[0.8em] w-full" />
       ) : l.kind.type === 'fence' ? (
         <>
-          <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
+          {/*
+           * 围栏默认**不显示** —— 参考实现里代码块只看得见代码与右上角的语言标签，
+           * ` ``` ` 那一行是看不见的（用户明确要求照此改）。
+           * 光标停到这一行才露出源码，与标题/引用等"语法随光标浮现"一致。
+           *
+           * ⚠️ 不能整条不渲染：围栏行是光标进出代码块的落点，
+           * 而且它还要承载右上角的语言按钮。
+           */}
+          {caretCol >= 0 ? (
+            <span className="text-muted-foreground/40">{l.src || '\u00a0'}</span>
+          ) : (
+            <span className="md-fence-ghost" aria-hidden="true" />
+          )}
           {/* 语言标签只挂在开围栏上 */}
           {l.codeFence && (
             <button
@@ -3386,6 +3748,13 @@ const EditorLine = memo(function EditorLine({
           <div
             key={ci}
             data-cell=""
+            /** 列对齐：`none` 不写，交给浏览器默认（表头本来就会加粗居左） */
+            style={{
+              textAlign:
+                l.tableAligns?.[ci] && l.tableAligns[ci] !== 'none'
+                  ? (l.tableAligns[ci] as 'left' | 'center' | 'right')
+                  : undefined,
+            }}
             className="border-r border-border px-3 py-1.5 whitespace-pre-wrap last:border-r-0"
           >
             {sliceSegs(l.segs, r.from, r.to).map((p, k) => (

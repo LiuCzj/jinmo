@@ -10,7 +10,9 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import * as Dialog from '@radix-ui/react-dialog';
+import * as Popover from '@radix-ui/react-popover';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import {
   Bold,
   Italic,
@@ -50,6 +52,10 @@ import {
   ArrowLeftToLine,
   ArrowRightToLine,
   AlignLeft,
+  AlignCenter,
+  AlignRight,
+  AlignJustify,
+  Ellipsis,
   Sigma,
   Search,
   IndentIncrease,
@@ -131,6 +137,46 @@ export interface FloatPos {
  * @param props.onRun 点某条命令时触发
  * @param props.onClose 需要关闭时（点了别处、按了 Esc）通知调用方
  */
+/**
+ * 给 Radix 的虚拟锚点：把「一个视口坐标」包成只报边界矩形的假元素。
+ *
+ * 浮层要贴在调用方算好的坐标上（鼠标位置 / 选区上方），那里没有真实 DOM 元素，
+ * 所以造一个假元素交给 Radix，定位 / 翻转 / 防溢出由它负责。
+ *
+ * ⚠️ 每次渲染都刷新 `getBoundingClientRect` —— `useRef` 的初值只算一次，
+ * 坐标变了却还报旧矩形的话，浮层会钉在第一次的位置上。
+ *
+ * @param pos 视口坐标（左上角）
+ * @returns 可直接传给 `virtualRef` 的 ref
+ */
+function useVirtualAnchor(pos: FloatPos) {
+  const ref = useRef({
+    getBoundingClientRect: () => ({
+      x: pos.x,
+      y: pos.y,
+      width: 0,
+      height: 0,
+      top: pos.y,
+      left: pos.x,
+      right: pos.x,
+      bottom: pos.y,
+      toJSON: () => ({}),
+    }),
+  });
+  ref.current.getBoundingClientRect = () => ({
+    x: pos.x,
+    y: pos.y,
+    width: 0,
+    height: 0,
+    top: pos.y,
+    left: pos.x,
+    right: pos.x,
+    bottom: pos.y,
+    toJSON: () => ({}),
+  });
+  return ref;
+}
+
 export function FormatBubble({
   pos,
   commands,
@@ -142,45 +188,58 @@ export function FormatBubble({
   onRun: (id: string) => void;
   onClose: () => void;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
+  /**
+   * 气泡位置是调用方按选区算好的视口坐标。
+   * `side="bottom" align="start" sideOffset={0}` 让内容左上角正好落在该坐标，
+   * 与旧的 `style={{left, top}}` 等价；越界翻转 / 防溢出交给 Radix。
+   */
+  const anchorRef = useVirtualAnchor(pos);
 
-  useEffect(() => {
-    // 用 mousedown 而非 click：click 到达时选区已被按下动作清掉
-    const onDown = (e: MouseEvent) => {
-      if (!ref.current?.contains(e.target as Node)) onClose();
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [onClose]);
-
-  return createPortal(
-    <div
-      ref={ref}
-      role="toolbar"
-      aria-label="格式"
-      style={{ left: pos.x, top: pos.y }}
-      className="fixed z-[300] flex items-center gap-0.5 rounded-lg border border-border bg-card p-1 shadow-xl"
-      // 气泡自己不许被选中，否则「按下鼠标想点按钮」会先把选区弄丢
-      onMouseDown={(e) => e.preventDefault()}
+  return (
+    <Popover.Root
+      open
+      onOpenChange={(o) => {
+        if (!o) onClose();
+      }}
     >
-      {commands.map((c) => (
-        <button
-          key={c.id}
-          type="button"
-          title={c.hint ? `${c.label}（${c.hint}）` : c.label}
-          aria-label={c.label}
-          onClick={() => onRun(c.id)}
-          className={`flex size-7 items-center justify-center rounded-md transition-colors ${
-            c.active
-              ? 'bg-accent/15 text-accent'
-              : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
-          }`}
+      <Popover.Anchor virtualRef={anchorRef} />
+      <Popover.Portal>
+        <Popover.Content
+          role="toolbar"
+          aria-label="格式"
+          side="bottom"
+          align="start"
+          sideOffset={0}
+          collisionPadding={8}
+          className="z-[300] flex items-center gap-0.5 rounded-lg border border-border bg-card p-1 shadow-xl outline-none"
+          /**
+           * 绝不能抢焦点：气泡出现时用户还在编辑、选区还在，抢焦点会把选区弄丢。
+           * 关闭后同理，焦点交给调用方。
+           */
+          onOpenAutoFocus={(e) => e.preventDefault()}
+          onCloseAutoFocus={(e) => e.preventDefault()}
+          // 气泡自己不许被选中，否则「按下鼠标想点按钮」会先把选区弄丢
+          onMouseDown={(e) => e.preventDefault()}
         >
-          <c.icon size={15} aria-hidden="true" />
-        </button>
-      ))}
-    </div>,
-    document.body,
+          {commands.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              title={c.hint ? `${c.label}（${c.hint}）` : c.label}
+              aria-label={c.label}
+              onClick={() => onRun(c.id)}
+              className={`flex size-7 items-center justify-center rounded-md transition-colors ${
+                c.active
+                  ? 'bg-accent/15 text-accent'
+                  : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
+              }`}
+            >
+              <c.icon size={15} aria-hidden="true" />
+            </button>
+          ))}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 
@@ -203,212 +262,194 @@ export function ContextMenu({
   onRun: (id: string) => void;
   onClose: () => void;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
-  /** 当前展开的子菜单（下标 + 飞出位置） */
-  const [openSub, setOpenSub] = useState<{ index: number; pos: FloatPos } | null>(null);
   /**
-   * 关闭子菜单的延时句柄。
+   * 菜单要贴在鼠标位置，而鼠标位置没有真实元素 —— 放一个 0×0 的隐形锚点。
    *
-   * 不能一离开主菜单就立刻关：菜单与飞出层之间隔着几个像素的缝，
-   * 鼠标穿过去的瞬间就会触发主菜单的 `onMouseLeave`，子菜单当场消失、点不到。
-   * 给一点缓冲，鼠标进到飞出层就取消。
+   * 菜单本身（外点关闭 / Escape / 子菜单 / 键盘导航 / 焦点管理 / 越界翻转）
+   * 全部交给 Radix DropdownMenu，不再自绘。
    */
-  const closeTimer = useRef<number | null>(null);
-  const cancelClose = () => {
-    if (closeTimer.current !== null) {
-      clearTimeout(closeTimer.current);
-      closeTimer.current = null;
-    }
-  };
-  const scheduleClose = () => {
-    cancelClose();
-    closeTimer.current = window.setTimeout(() => setOpenSub(null), 260);
-  };
-  useEffect(() => cancelClose, []);
-
   useEffect(() => {
-    const onDown = (e: PointerEvent) => {
-      const t = e.target as Element | null;
-      /**
-       * 只有点到「菜单项按钮」才不关 —— 关早了按钮收不到 click，命令就丢了。
-       *
-       * 按「点在菜单范围内就不关」判定会形成死区：该区域内点击无法关闭菜单。
-       */
-      if (t?.closest?.('[role="menuitem"]')) return;
-      onClose();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
     /**
-     * 滚动 / 滚轮 / 窗口失焦都要关掉：菜单是 `fixed` 定位的，页面一滚它就钉在原地、跟内容脱节。
-     * `pointerdown` 用捕获阶段：比冒泡阶段的 mousedown 更不容易被中途拦掉。
+     * 滚动 / 滚轮 / 窗口尺寸变化要关掉菜单。
      *
-     * 但**发生在菜单自己身上**的滚动/滚轮不算「页面动了」：菜单可以比视口高（`overflow-y-auto`），
-     * 语言列表就有 28 项。不排除的话滚一下就把菜单关了，等于没法用。
+     * 这是**产品规则**不是通用能力：菜单贴的是鼠标位置（fixed 定位），
+     * 页面一滚它就钉在原地跟内容脱节。Radix 不做这件事。
+     *
+     * 但发生在菜单自己身上的滚动不算「页面动了」：菜单可以比视口高
+     * （`overflow-y-auto`），滚一下就把菜单关了等于没法用。
+     * 刚弹出的一小段时间也宽限：Radix 打开时会聚焦内容，可能补发一次 scroll。
      */
-    const inMenu = (t: EventTarget | null) =>
-      t instanceof Element && !!t.closest('[role="menu"]');
+    const openedAt = Date.now();
+    const inMenu = (t: EventTarget | null) => t instanceof Element && !!t.closest('[role="menu"]');
     const onScroll = (e: Event) => {
       if (inMenu(e.target)) return;
+      if (Date.now() - openedAt < 300) return;
       onClose();
     };
     const onDismiss = () => onClose();
-    document.addEventListener('pointerdown', onDown, true);
-    document.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, { capture: true, passive: true });
     window.addEventListener('wheel', onScroll, { passive: true });
     window.addEventListener('resize', onDismiss, { passive: true });
-    window.addEventListener('blur', onDismiss);
     return () => {
-      document.removeEventListener('pointerdown', onDown, true);
-      document.removeEventListener('keydown', onKey);
       window.removeEventListener('scroll', onScroll, { capture: true });
       window.removeEventListener('wheel', onScroll);
       window.removeEventListener('resize', onDismiss);
-      window.removeEventListener('blur', onDismiss);
     };
   }, [onClose]);
 
-  /**
-   * 按条目数估算菜单高度。
-   *
-   * 要按全部条目（含分隔线）算并留余量：只按命令项算会估小
-   * （实测一处分隔线就让估算少了 23px），夹取差一截、菜单仍会超出视口底部。
-   */
-  const estHeight = (list: MdMenuItem[]): number => list.length * 30 + 16;
-
-  const estH = estHeight(items);
-  const estW = 200;
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 1024;
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 768;
-  /**
-   * 垂直方向：放得下就贴光标，放不下就整体上移到刚好放进视口。
-   * 直接翻到光标上方会被夹到 `top: 4`，菜单会弹出在屏幕顶部并盖住顶栏。
-   */
-  const x = pos.x + estW > vw ? Math.max(4, pos.x - estW) : pos.x;
-  const y = pos.y + estH > vh - 8 ? Math.max(4, vh - estH - 8) : pos.y;
-
-  /**
-   * 悬停某个子菜单项时算出飞出位置。
-   *
-   * 垂直方向必须夹取：不夹的话靠近窗口底部的子菜单会整片跑到视口外被裁掉。
-   *
-   * @param index 子菜单在 items 里的下标
-   * @param el 触发项元素
-   */
-  const openSubmenuAt = (index: number, el: HTMLElement) => {
-    cancelClose();
-    const r = el.getBoundingClientRect();
-    const w = 190;
-    const inner = items[index] && isSubmenu(items[index]) ? (items[index] as MdSubmenu).items : [];
-    const subH = estHeight(inner);
-    const x = r.right + 2 + w > vw ? Math.max(4, r.left - w - 2) : r.right + 2;
-    const y = Math.max(4, Math.min(r.top - 6, vh - subH - 8));
-    setOpenSub({ index, pos: { x, y } });
-  };
-
-  /** 渲染子菜单里的条目（不递归，只支持一层） */
-  const renderLeaf = (item: MdMenuItem, key: string) =>
-    isSeparator(item) ? (
-      <div key={key} className="my-1 border-t border-border" />
-    ) : isSubmenu(item) || isIconRow(item) ? null : (
-      <button
-        key={item.id}
-        type="button"
-        role="menuitem"
-        onClick={() => onRun(item.id)}
-        className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors ${
-          item.active ? 'bg-accent/10 text-accent' : 'text-foreground hover:bg-foreground/[0.06]'
+  /** 渲染一条叶子命令（分隔线 / 子菜单 / 图标行不在这里） */
+  const renderLeaf = (item: MdMenuItem, key: string) => {
+    if (isSeparator(item)) {
+      return <DropdownMenu.Separator key={key} className="my-1 border-t border-border" />;
+    }
+    if (isSubmenu(item) || isIconRow(item)) return null;
+    return (
+      <DropdownMenu.Item
+        key={key}
+        aria-label={item.label}
+        onSelect={() => onRun(item.id)}
+        className={`flex cursor-default items-center gap-2.5 px-3 py-1.5 text-left text-sm outline-none transition-colors ${
+          item.active
+            ? 'bg-accent/10 text-accent'
+            : 'text-foreground data-[highlighted]:bg-foreground/[0.06]'
         }`}
       >
         <item.icon size={15} aria-hidden="true" />
         <span className="flex-1">{item.label}</span>
         {item.hint && <span className="text-[11px] text-muted-foreground">{item.hint}</span>}
-      </button>
+      </DropdownMenu.Item>
     );
+  };
 
-  return createPortal(
-    <>
-      <div
-        ref={ref}
-        role="menu"
-        style={{ left: x, top: y, minWidth: estW, maxHeight: vh - 16 }}
-        className="fixed z-[300] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-2xl"
-        onMouseEnter={cancelClose}
-        onMouseLeave={scheduleClose}
-      >
-        {items.map((item, i) => {
-          if (isSeparator(item)) return <div key={`sep-${i}`} className="my-1 border-t border-border" />;
-
-          // 一排图标按钮（行内格式 / 块级包裹 / 缩进）
-          if (isIconRow(item)) {
-            return (
-              <div key={`row-${i}`} className="flex items-center gap-0.5 px-2 py-1">
-                {item.icons.map((c) => (
-                  <button
-                    key={c.id}
-                    type="button"
-                    role="menuitem"
-                    title={c.hint ? `${c.label}（${c.hint}）` : c.label}
-                    aria-label={c.label}
-                    aria-pressed={c.active ? true : undefined}
-                    onClick={() => onRun(c.id)}
-                    className={`flex size-7 items-center justify-center rounded-md transition-colors ${
-                      c.active
-                        ? 'bg-accent/12 text-accent'
-                        : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
-                    }`}
-                  >
-                    <c.icon size={15} aria-hidden="true" />
-                  </button>
-                ))}
-              </div>
-            );
-          }
-
-          // 子菜单
-          if (isSubmenu(item)) {
-            return (
-              <button
-                key={`sub-${i}`}
-                type="button"
-                role="menuitem"
-                aria-haspopup="menu"
-                onMouseEnter={(e) => openSubmenuAt(i, e.currentTarget)}
-                onClick={(e) => openSubmenuAt(i, e.currentTarget)}
-                className={`flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors ${
-                  openSub?.index === i ? 'bg-foreground/[0.06]' : 'text-foreground hover:bg-foreground/[0.06]'
-                }`}
-              >
-                <item.icon size={15} aria-hidden="true" />
-                <span className="flex-1">{item.label}</span>
-                <span className="text-[11px] text-muted-foreground">▸</span>
-              </button>
-            );
-          }
-
-          return renderLeaf(item, item.id);
-        })}
-      </div>
-
-      {/* 子菜单飞出层：fixed 定位，不受主菜单的 overflow 裁切 */}
-      {openSub && (
-        <div
-          data-submenu=""
-          role="menu"
-          style={{ left: openSub.pos.x, top: openSub.pos.y, minWidth: 180, maxHeight: vh - 16 }}
-          className="fixed z-[310] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-2xl"
-          onMouseEnter={cancelClose}
-          onMouseLeave={scheduleClose}
+  return (
+    <DropdownMenu.Root
+      open
+      // modal 必须关：Radix 默认会把 body 的 pointer-events 置空并给其余内容加 aria-hidden，
+      // 那会让底下的编辑器完全点不动。
+      modal={false}
+      onOpenChange={(o) => {
+        if (!o) onClose();
+      }}
+    >
+      <DropdownMenu.Trigger asChild>
+        <span
+          aria-hidden="true"
+          tabIndex={-1}
+          style={{ position: 'fixed', left: pos.x, top: pos.y, width: 0, height: 0, pointerEvents: 'none' }}
+        />
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          side="bottom"
+          align="start"
+          sideOffset={0}
+          collisionPadding={8}
+          className="z-[300] max-h-[calc(100vh-16px)] min-w-[200px] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-2xl outline-none"
+          // 关闭后不把焦点还给那个隐形锚点；选命令时由 runCommand 自己把焦点交回编辑器
+          onCloseAutoFocus={(e) => e.preventDefault()}
         >
-          {items[openSub.index] && isSubmenu(items[openSub.index])
-            ? (items[openSub.index] as MdSubmenu).items.map((s, k) => renderLeaf(s, `sub-${k}`))
-            : null}
-        </div>
-      )}
-    </>,
-    document.body,
+          {items.map((item, i) => {
+            if (isSeparator(item)) {
+              return <DropdownMenu.Separator key={`sep-${i}`} className="my-1 border-t border-border" />;
+            }
+
+            // 一排图标按钮（行内格式 / 块级包裹 / 缩进）：点一下直接生效
+            if (isIconRow(item)) {
+              return (
+                <DropdownMenu.Item
+                  key={`row-${i}`}
+                  // 这一行本身不是命令，别让 Radix 把它当条目「选中」而关菜单
+                  onSelect={(e) => e.preventDefault()}
+                  className="flex cursor-default items-center gap-0.5 px-2 py-1 outline-none"
+                >
+                  {item.icons.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      title={c.hint ? `${c.label}（${c.hint}）` : c.label}
+                      aria-label={c.label}
+                      aria-pressed={c.active ? true : undefined}
+                      onClick={() => onRun(c.id)}
+                      className={`flex size-7 items-center justify-center rounded-md transition-colors ${
+                        c.active
+                          ? 'bg-accent/12 text-accent'
+                          : 'text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
+                      }`}
+                    >
+                      <c.icon size={15} aria-hidden="true" />
+                    </button>
+                  ))}
+                </DropdownMenu.Item>
+              );
+            }
+
+            // 子菜单：悬停 / 右方向键展开，由 Radix 负责
+            if (isSubmenu(item)) {
+              return (
+                <DropdownMenu.Sub key={`sub-${i}`}>
+                  <DropdownMenu.SubTrigger className="flex cursor-default items-center gap-2.5 px-3 py-1.5 text-left text-sm text-foreground outline-none transition-colors data-[highlighted]:bg-foreground/[0.06] data-[state=open]:bg-foreground/[0.06]">
+                    <item.icon size={15} aria-hidden="true" />
+                    <span className="flex-1">{item.label}</span>
+                    <span className="text-[11px] text-muted-foreground">▸</span>
+                  </DropdownMenu.SubTrigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.SubContent
+                      collisionPadding={8}
+                      className="z-[310] max-h-[calc(100vh-16px)] min-w-[180px] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-2xl outline-none"
+                    >
+                      {item.items.map((sub, k) => renderLeaf(sub, `sub-${i}-${k}`))}
+                    </DropdownMenu.SubContent>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Sub>
+              );
+            }
+
+            return renderLeaf(item, item.id);
+          })}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+// ── 弹窗外壳（Radix Dialog）────────────────────────────────
+
+/**
+ * 弹窗基座：外点关闭 / Escape / 焦点陷阱 / **关闭后焦点归还原处**全部由 Radix 负责。
+ *
+ * 这些以前是自绘的，踩过一串坑：
+ * - 关闭后焦点落回 `<body>` → 紧接着打字**一个字都进不去**（实测）
+ * - 遮罩的 `onMouseDown` 要手动 `stopPropagation`，漏一处就点内容也关窗
+ * - 输入框要手动 `autoFocus`，还要自己处理 Escape
+ *
+ * @param props.title 标题（同时作为无障碍名）
+ * @param props.onClose 关闭（外点 / Escape / 取消都走它）
+ * @param props.width 内容宽度类名
+ */
+function ModalShell({
+  title,
+  onClose,
+  width = 'w-[320px]',
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  width?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Dialog.Root open onOpenChange={(o) => { if (!o) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[320] bg-foreground/20" />
+        <Dialog.Content
+          aria-label={title}
+          className={`fixed left-1/2 top-[18vh] z-[321] -translate-x-1/2 rounded-lg border border-border bg-card p-4 shadow-2xl ${width}`}
+        >
+          <Dialog.Title className="mb-3 text-sm font-bold text-foreground">{title}</Dialog.Title>
+          {children}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -459,18 +500,9 @@ export function PromptDialog({
     onConfirm(t);
   };
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[320] flex items-start justify-center bg-foreground/20 pt-[18vh]"
-      onMouseDown={onCancel}
-    >
-      <div
-        role="dialog"
-        aria-label={title}
-        className="w-[420px] rounded-lg border border-border bg-card p-4 shadow-2xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <p className="mb-3 text-sm font-bold text-foreground">{title}</p>
+  return (
+    <ModalShell title={title} onClose={onCancel} width="w-[420px]">
+      <div>
         {label && <p className="mb-1.5 text-xs text-muted-foreground">{label}</p>}
         <input
           autoFocus
@@ -494,8 +526,7 @@ export function PromptDialog({
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </ModalShell>
   );
 }
 
@@ -517,14 +548,6 @@ export function TableInsertDialog({
   const [cols, setCols] = useState('3');
   const [rows, setRows] = useState('3');
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onCancel]);
-
   /** 把输入夹到合法范围；空值或非数字才退回默认值 */
   const clampNum = (v: string, min: number, max: number, dflt: number) => {
     const n = Math.floor(Number(v));
@@ -535,18 +558,9 @@ export function TableInsertDialog({
   const INPUT =
     'w-16 rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground outline-none focus:border-ring';
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[320] flex items-start justify-center bg-foreground/20 pt-[18vh]"
-      onMouseDown={onCancel}
-    >
-      <div
-        role="dialog"
-        aria-label="插入表格"
-        className="w-[320px] rounded-lg border border-border bg-card p-4 shadow-2xl"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <p className="mb-3 text-sm font-bold text-foreground">插入表格</p>
+  return (
+    <ModalShell title="插入表格" onClose={onCancel}>
+      <div>
         <div className="flex items-center gap-3 text-sm text-foreground">
           <label className="flex items-center gap-1.5">
             列
@@ -586,8 +600,7 @@ export function TableInsertDialog({
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </ModalShell>
   );
 }
 
@@ -611,23 +624,23 @@ export function LangPicker({
   /**
    * 候选列表 = matchLangs 的匹配结果。
    * 空输入时在最前面补一条「纯文本」，用来把语言清掉（等价于清空输入，但更容易发现）。
+   *
+   * `matchLangs` 在「唯一命中且与输入完全相同」时会返回空数组 —— 那是给
+   * "已经敲全了、别再弹提示"的场景设计的（单测 `matchLangs('json') === []` 就是断这个）。
+   * 但在本面板里列表**就是全部内容**，返回空只会显示「无匹配」，用户明明把语言打全了；
+   * 而且打全后按回车也提交不了。所以这里把精确命中的那一条补回来。
    */
   const matched = matchLangs(query);
+  const exactHit =
+    query === '' ? undefined : matchLangs('').find((l) => l.toLowerCase() === query.toLowerCase());
+  const shown = matched.length ? matched : exactHit ? [exactHit] : [];
   const list: { id: string; label: string }[] = [
     ...(query === '' ? [{ id: '', label: PLAIN_LANG_LABEL }] : []),
-    ...matched.slice(0, MAX_LANG_HINTS).map((l) => ({ id: l, label: l })),
+    ...shown.slice(0, MAX_LANG_HINTS).map((l) => ({ id: l, label: l })),
   ];
 
-  const w = 240;
-  const maxH = 300;
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 1024;
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 768;
-  const x = Math.min(Math.max(4, pos.x), Math.max(4, vw - w - 4));
-  const y = pos.y + maxH + 4 > vh ? Math.max(4, pos.y - maxH - 8) : pos.y + 4;
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+  /** 面板贴在右键点出来的坐标上，定位 / 翻转 / 防溢出交给 Radix */
+  const anchorRef = useVirtualAnchor(pos);
 
   useEffect(() => {
     setHi(0);
@@ -639,118 +652,116 @@ export function LangPicker({
     el?.scrollIntoView({ block: 'nearest' });
   }, [hi, list.length]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onClose();
-        return;
-      }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setHi((h) => Math.min(h + 1, Math.max(0, list.length - 1)));
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setHi((h) => Math.max(h - 1, 0));
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const pick = list[hi];
-        if (pick) onPick(pick.id);
-        else if (query === '') onPick('');
-      }
-    };
-    const onDown = (e: PointerEvent) => {
-      const t = e.target as Element | null;
-      if (t?.closest?.('[data-lang-picker]')) return;
-      onClose();
-    };
-    /**
-     * 滚轮 / 滚动发生在面板自己身上不算「页面动了」——
-     * 语言列表可以滚，滚一下就关没法用（和 ContextMenu 同一条规则）。
-     */
-    const onScroll = (e: Event) => {
-      if (e.target instanceof Element && e.target.closest('[data-lang-picker]')) return;
-      onClose();
-    };
-    document.addEventListener('keydown', onKey, true);
-    document.addEventListener('pointerdown', onDown, true);
-    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
-    window.addEventListener('wheel', onScroll, { passive: true });
-    return () => {
-      document.removeEventListener('keydown', onKey, true);
-      document.removeEventListener('pointerdown', onDown, true);
-      window.removeEventListener('scroll', onScroll, { capture: true });
-      window.removeEventListener('wheel', onScroll);
-    };
-  }, [list, hi, query, onPick, onClose]);
-
-  return createPortal(
-    <div
-      data-lang-picker=""
-      role="listbox"
-      aria-label="选择代码块语言"
-      style={{ left: x, top: y, width: w }}
-      className="fixed z-[320] overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
+  return (
+    <Popover.Root
+      open
+      onOpenChange={(o) => {
+        if (!o) onClose();
+      }}
     >
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <Search size={14} className="text-muted-foreground" aria-hidden="true" />
-        <input
-          ref={inputRef}
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="选择语言"
-          aria-label="搜索语言"
-          className="w-full bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
-        />
-        <span className="shrink-0 text-[11px] text-muted-foreground">{list.length}</span>
-      </div>
-      <div
-        ref={listRef}
-        data-lang-picker-list=""
-        className="max-h-[264px] overflow-y-auto py-1"
-        style={{ maxHeight: maxH - 36 }}
-      >
-        {list.length === 0 && (
-          <div className="px-3 py-2 text-sm text-muted-foreground" data-lang-picker="">
-            无匹配
+      <Popover.Anchor virtualRef={anchorRef} />
+      <Popover.Portal>
+        <Popover.Content
+          data-lang-picker=""
+          role="listbox"
+          aria-label="选择代码块语言"
+          side="bottom"
+          align="start"
+          sideOffset={4}
+          collisionPadding={8}
+          className="z-[330] w-[240px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl outline-none"
+          /**
+           * 自己聚焦搜索框，并带 `preventScroll` ——
+           * 面板贴边时输入框可能有一截在视口外，默认聚焦会让浏览器把它滚进视野、
+           * 页面跟着动一下（用户反馈过"屏幕乱动"）。
+           */
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            inputRef.current?.focus({ preventScroll: true });
+          }}
+          /** 关闭后不把焦点还给触发元素（那个元素是个虚拟锚点），交给调用方处理 */
+          onCloseAutoFocus={(e) => e.preventDefault()}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              setHi((h) => Math.min(h + 1, Math.max(0, list.length - 1)));
+              return;
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              setHi((h) => Math.max(h - 1, 0));
+              return;
+            }
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              const pick = list[hi];
+              if (pick) onPick(pick.id);
+              else if (query === '') onPick('');
+            }
+          }}
+        >
+          <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+            <Search size={14} className="text-muted-foreground" aria-hidden="true" />
+            <input
+              ref={inputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="选择语言"
+              aria-label="搜索语言"
+              className="w-full bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
+            />
+            <span className="shrink-0 text-[11px] text-muted-foreground">{list.length}</span>
           </div>
-        )}
-        {list.map((lang, i) => (
-          <button
-            key={lang.id || '__plain__'}
-            type="button"
-            data-lang-li={i}
-            data-lang-picker=""
-            onMouseEnter={() => setHi(i)}
-            onClick={() => onPick(lang.id)}
-            className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors ${
-              i === hi ? 'bg-foreground/[0.06]' : 'hover:bg-foreground/[0.06]'
-            }`}
-          >
-            <span className="flex-1 font-mono text-[13px] text-foreground">{lang.label}</span>
-            {lang.id !== '' && lang.id === current && (
-              <span className="text-[11px] text-accent">当前</span>
+          <div ref={listRef} data-lang-picker-list="" className="max-h-[264px] overflow-y-auto py-1">
+            {list.length === 0 && (
+              <div className="px-3 py-2 text-sm text-muted-foreground" data-lang-picker="">
+                无匹配
+              </div>
             )}
-          </button>
-        ))}
-      </div>
-    </div>,
-    document.body,
+            {list.map((lang, i) => (
+              <button
+                key={lang.id || '__plain__'}
+                type="button"
+                data-lang-li={i}
+                data-lang-picker=""
+                onMouseEnter={() => setHi(i)}
+                onClick={() => onPick(lang.id)}
+                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition-colors ${
+                  i === hi ? 'bg-foreground/[0.06]' : 'hover:bg-foreground/[0.06]'
+                }`}
+              >
+                <span className="flex-1 font-mono text-[13px] text-foreground">{lang.label}</span>
+                {lang.id !== '' && lang.id === current && (
+                  <span className="text-[11px] text-accent">当前</span>
+                )}
+              </button>
+            ))}
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
 
 // ── 命令表 ────────────────────────────────────────────────
 
-/** 行内格式（气泡用，也是右键菜单第一排按钮） */
+/**
+ * 行内格式（气泡用，也是右键菜单第一排按钮）。
+ *
+ * 顺序：加粗 / 斜体 / 删除线 / 高亮 / 行内代码 / 行内公式 / 链接。
+ * 删除线、高亮、行内公式原先只有命令实现（或连命令都没有）而没有菜单入口，
+ * 导致右键菜单够不着 —— 见 `strike` / `highlight` / `math` 三条。
+ *
+ * @returns 行内格式按钮（`id` 交给 runCommand 分发）
+ */
 export const INLINE_COMMANDS: MdCommand[] = [
   { id: 'bold', label: '加粗', icon: Bold, hint: 'Ctrl+B' },
   { id: 'italic', label: '斜体', icon: Italic, hint: 'Ctrl+I' },
+  { id: 'strike', label: '删除线', icon: Strikethrough, hint: 'Alt+Shift+5' },
+  { id: 'highlight', label: '高亮', icon: Highlighter },
   { id: 'code', label: '行内代码', icon: Code, hint: 'Ctrl+`' },
+  { id: 'math', label: '行内公式', icon: Sigma },
   { id: 'link', label: '链接', icon: Link2, hint: 'Ctrl+K' },
 ];
 
@@ -896,8 +907,11 @@ export function buildLangMenu(lineIndex: number): MdMenuItem[] {
 /**
  * `插入 ▸` 子菜单。
  *
- * 条目顺序：图像 / ── / 脚注 / 链接引用 / 水平分割线 / 表格 /
+ * 条目顺序：图像 / 本地图片… / ── / 脚注 / 链接引用 / 水平分割线 / 表格 /
  * 代码块 / 公式块 / 内容目录 / YAML Front Matter / ── / 段落（上方）/ 段落（下方）。
+ *
+ * 「图像」问的是网络地址（写进 `![](url)`）；本地文件走「本地图片…」弹系统选择框。
+ * 两者必须分开：图片地址没法在文件选择框里输入，文件也没法在输入框里选。
  *
  * 列表与引用不在这组，收在 `段落 ▸` 里。
  *
@@ -909,6 +923,7 @@ function insertSubmenu(): MdSubmenu {
     icon: Plus,
     items: [
       { id: 'image', label: '图像', icon: ImageIcon },
+      { id: 'image-file', label: '本地图片…', icon: ImageIcon },
       { separator: true },
       { id: 'footnote', label: '脚注', icon: Type },
       { id: 'linkref', label: '链接引用', icon: LinkIcon },
@@ -926,7 +941,89 @@ function insertSubmenu(): MdSubmenu {
 }
 
 /**
- * 表格组的分组顺序：上方/下方插入行 → 左侧/右侧插入列 → 删除行/删除列 → 复制表格/格式化表格源码 → 删除表格。
+ * 表格悬浮条上的按钮。
+ *
+ * 鼠标移到表格上时浮出来，让「插入表格之后还能干什么」一眼可见 ——
+ * 否则这些能力只能靠右键 → 表格 ▸ 两层才找得到（用户反馈过"插入表格就没了"）。
+ * 点一下直接生效，走的是与右键菜单同一套命令。
+ */
+export const TABLE_BAR_ALIGNS: MdCommand[] = [
+  { id: 'table-align-left', label: '左对齐', icon: AlignLeft },
+  { id: 'table-align-center', label: '居中对齐', icon: AlignCenter },
+  { id: 'table-align-right', label: '右对齐', icon: AlignRight },
+];
+
+/**
+ * 表格悬浮工具条。
+ *
+ * 鼠标停在表格上时浮在表格上方；移开就消失（由调用方控制挂载）。
+ * 它**不抢焦点、不参与选区**：点按钮时按 hover 命中的那个格子算目标位置，
+ * 不去动编辑器里的光标，所以不会把用户正在做的事打断。
+ *
+ * @param props.pos 浮层坐标（表格左上角上方，视口坐标）
+ * @param props.onRun 点某条命令时触发，参数是命令 id
+ */
+export function TableBar({
+  pos,
+  onRun,
+  onMore,
+}: {
+  pos: FloatPos;
+  onRun: (id: string) => void;
+  /** 点「更多操作」时打开完整表格菜单（插入/删除/复制/格式化…） */
+  onMore: () => void;
+}) {
+  const anchorRef = useVirtualAnchor(pos);
+  return (
+    <Popover.Root open onOpenChange={() => {}}>
+      <Popover.Anchor virtualRef={anchorRef} />
+      <Popover.Portal>
+        <Popover.Content
+          role="toolbar"
+          aria-label="表格"
+          side="top"
+          align="start"
+          sideOffset={6}
+          collisionPadding={8}
+          className="z-[300] flex items-center gap-0.5 rounded-lg border border-border bg-card p-1 shadow-xl outline-none"
+          onOpenAutoFocus={(e) => e.preventDefault()}
+          onCloseAutoFocus={(e) => e.preventDefault()}
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {/* 列对齐三连：参考实现就是把这三个直接摆在表格上方左侧 */}
+          {TABLE_BAR_ALIGNS.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              title={c.label}
+              aria-label={c.label}
+              onClick={() => onRun(c.id)}
+              className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+            >
+              <c.icon size={15} aria-hidden="true" />
+            </button>
+          ))}
+          <span className="mx-0.5 h-4 w-px bg-border" />
+          {/* 其余全部收进「更多操作」——参考实现右上角那个按钮 */}
+          <button
+            type="button"
+            title="更多操作"
+            aria-label="更多操作"
+            onClick={onMore}
+            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <span className="text-[11px]">更多操作</span>
+            <Ellipsis size={14} aria-hidden="true" />
+          </button>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+/**
+ * 表格组的分组顺序：上方/下方插入行 → 左侧/右侧插入列 → 上移/下移该行、左移/右移该列 →
+ * 列对齐 → 删除行/删除列 → 复制表格/格式化表格源码 → 删除表格。
  *
  * @returns 表格操作条目
  */
@@ -937,6 +1034,18 @@ export function tableGroup(): MdMenuItem[] {
     { separator: true },
     { id: 'table-col-left', label: '左侧插入列', icon: ArrowLeftToLine },
     { id: 'table-col-right', label: '右侧插入列', icon: ArrowRightToLine },
+    { separator: true },
+    // 移动：行按整行交换、列连分隔行一起换（对齐标记跟着列走）
+    { id: 'table-row-up', label: '上移该行', icon: ArrowUpToLine },
+    { id: 'table-row-down', label: '下移该行', icon: ArrowDownToLine },
+    { id: 'table-col-move-left', label: '左移该列', icon: ArrowLeftToLine },
+    { id: 'table-col-move-right', label: '右移该列', icon: ArrowRightToLine },
+    { separator: true },
+    // 列对齐：写在分隔行上（`:---` / `:---:` / `---:`），按当前列生效
+    { id: 'table-align-left', label: '左对齐', icon: AlignLeft },
+    { id: 'table-align-center', label: '居中对齐', icon: AlignCenter },
+    { id: 'table-align-right', label: '右对齐', icon: AlignRight },
+    { id: 'table-align-none', label: '默认对齐', icon: AlignJustify },
     { separator: true },
     { id: 'table-row-delete', label: '删除行', icon: Trash2, hint: 'Ctrl+Shift+⌫' },
     { id: 'table-col-delete', label: '删除列', icon: Trash2 },
@@ -1044,6 +1153,17 @@ export function buildContextMenu(
      * 全靠「跳出」再右键会分不清是哪一块。
      */
     items.push(insertSubmenu());
+    /*
+     * 代码块里也要有「全选」。
+     *
+     * 它跟「撤销/重做」一样是**文档级**命令，不依赖光标在哪；只给段落菜单不给代码块菜单
+     * 会很别扭 —— 而且文档开头就是代码块时，右键拿到的就是这个菜单，
+     * 自动化脚本想「全选→剪切」清空整篇会一直失败（实测踩过）。
+     */
+    if (opts.extended) {
+      items.push({ separator: true });
+      items.push({ id: 'select-all', label: '全选', icon: TextSelect, hint: 'Ctrl+A' });
+    }
     items.push({ separator: true });
     items.push(...deleteGroup());
     return items;

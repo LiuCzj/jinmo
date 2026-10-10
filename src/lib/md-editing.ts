@@ -5,6 +5,7 @@
  */
 
 import { listPrefixOf } from './md-inline';
+import { inCodeFence } from './md-commands';
 
 /** 一次编辑的结果 */
 export interface EditOutcome {
@@ -80,7 +81,15 @@ export function del(text: string, caret: number): EditOutcome {
 export function enter(text: string, caret: number): EditOutcome {
   const { index, start } = lineIndexOf(text, caret);
   const line = text.split('\n')[index] ?? '';
-  const lp = listPrefixOf(line);
+  /**
+   * 代码块里回车**只换行**，不做列表续行。
+   *
+   * `listPrefixOf` 只看行文本，会把代码里长得像列表的行误判成列表项 ——
+   * 例如 YAML 的 `      - "8080:80"`，回车后续上 `- ` 前缀，把代码内容一行行改坏
+   * （实测：一个 22 行的 compose 片段被插成了 `      -     volumes:`、`      -           - ./dist:…`，
+   * 缩进逐行累加）。围栏内不是 Markdown 结构，必须排除。
+   */
+  const lp = inCodeFence(text, caret) ? null : listPrefixOf(line);
 
   if (lp && caret >= start + lp.len) {
     if (line.slice(lp.len).trim() === '') {
