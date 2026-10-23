@@ -49,6 +49,16 @@ export function isLangSupported(lang: string): boolean {
 }
 
 /**
+ * 着色结果缓存。
+ *
+ * 代码行在光标移动、选区变化、查找高亮时都会重渲染，而源码一个字都没变；
+ * 每次都跑一遍 highlight.js 是纯浪费（它内部要建词法状态机）。
+ * 键是「语言 + 源码」，值是 HTML —— 纯函数，可以安全跨实例共享。
+ */
+const CACHE_MAX = 400;
+const cache = new Map<string, string>();
+
+/**
  * 给一段代码着色，返回 HTML 片段。
  *
  * 按**单行**调用 —— 代码块是逐行渲染的，所以跨行的块注释、多行字符串
@@ -62,11 +72,29 @@ export function highlightCode(code: string, lang: string): string {
   const id = normalizeLang(lang);
   if (PLAIN_LANGS.has(id)) return escapeHtml(code);
   if (!hljs.getLanguage(id)) return escapeHtml(code);
+
+  const key = id + '\u0000' + code;
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    // 命中后挪到末尾，维持「最久未用在前」的顺序
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+
+  let out: string;
   try {
     // ignoreIllegals：行级片段可能从半个字符串/注释中间开始，语法不完整，
     // 不能让库抛错，否则整行渲染会挂。
-    return hljs.highlight(code, { language: id, ignoreIllegals: true }).value;
+    out = hljs.highlight(code, { language: id, ignoreIllegals: true }).value;
   } catch {
-    return escapeHtml(code);
+    out = escapeHtml(code);
   }
+
+  if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  cache.set(key, out);
+  return out;
 }

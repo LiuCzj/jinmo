@@ -55,6 +55,14 @@ export default function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   /** 是否有未保存改动 */
   const [dirty, setDirty] = useState(false);
+  /**
+   * 正文的最新值。
+   *
+   * `save` 必须读到当前文本，但不能把 `text` 写进依赖 —— 否则每次击键都会重建
+   * `save`，连带把下面那个菜单订阅 effect 重跑一遍（`ipcRenderer.off` + `on` 每键一次）。
+   */
+  const textRef = useRef(text);
+  textRef.current = text;
 
   const desktop = typeof window !== 'undefined' ? window.desktop : undefined;
 
@@ -67,13 +75,22 @@ export default function App() {
   const save = useCallback(
     async (pickPath?: boolean) => {
       if (!desktop) return;
-      const res = await desktop.saveFile(text, pickPath ? null : filePath);
-      if (res) {
-        setFilePath(res.path);
-        setDirty(false);
+      let saved = false;
+      try {
+        const res = await desktop.saveFile(textRef.current, pickPath ? null : filePath);
+        if (res) {
+          setFilePath(res.path);
+          setDirty(false);
+          saved = true;
+        }
+      } finally {
+        // 无论成功、取消另存为还是写盘失败，都要告诉桌面壳「保存流程结束了」，
+        // 否则关窗时主进程只能干等超时。成败随信号带过去 —— `setDirty(false)`
+        // 是 effect 里异步生效的，信号到达时主进程读到的 dirty 还是旧值。
+        desktop.notifySaveSettled(saved);
       }
     },
-    [desktop, filePath, text],
+    [desktop, filePath],
   );
 
   const open = useCallback(async () => {

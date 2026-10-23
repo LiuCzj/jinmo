@@ -63,6 +63,27 @@ const HTML_TAGS = [
 /** 允许渲染的单个标签（无内容），如 `<br>` */
 const HTML_VOID = ['br'];
 
+/** 字母或数字。下划线强调不能出现在词内，判断用它 */
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
+/**
+ * 强调标记能否在此处开启。
+ *
+ * `_` 系列不能在词内（`snake_case` / `x__y__z`），且不能是更长标记的残余
+ * （`___y___` 里的后两个 `_` 前面还是 `_`，单独当开标记会把 `x___y___z` 拆成加粗）。
+ *
+ * @param src 整行源码
+ * @param i 标记起始列
+ * @param mark 标记本身（`*` / `_` / `**` / `__` / `***` / `___`）
+ * @returns 能否作为开标记
+ */
+function canOpenEmphasis(src: string, i: number, mark: string): boolean {
+  if (!mark.startsWith('_')) return true;
+  const before = src[i - 1];
+  if (before === undefined) return true;
+  return before !== '_' && !WORD_CHAR.test(before);
+}
+
 /**
  * 把一行源码切成可见片段。
  *
@@ -250,9 +271,10 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
       }
     }
 
-    // 粗斜体 ***x***。必须先于 ** 匹配，否则会被拆成 `**` + `*x*`
-    if (src.startsWith('***', i)) {
-      const end = src.indexOf('***', i + 3);
+    // 粗斜体 ***x*** / ___x___。必须先于 ** 与 * 匹配，否则会被拆成 `**` + `*x*`
+    const triple = src.startsWith('***', i) ? '***' : src.startsWith('___', i) ? '___' : null;
+    if (triple) {
+      const end = canOpenEmphasis(src, i, triple) ? src.indexOf(triple, i + 3) : -1;
       if (end !== -1) {
         flush();
         segs.push({
@@ -284,10 +306,21 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
       }
     }
 
-    // 加粗与删除线。两字符标记必须先于单字符标记匹配
-    const pair = src.startsWith('**', i) ? '**' : src.startsWith('~~', i) ? '~~' : null;
+    /**
+     * 加粗与删除线。两字符标记必须先于单字符标记匹配。
+     *
+     * `__` 与 `_` 同源，同样不能在词内开标记（`snake__case` 不是加粗）；
+     * 不单独处理会被下面的斜体分支吞成 `em("_case")`。
+     */
+    const pair = src.startsWith('**', i)
+      ? '**'
+      : src.startsWith('__', i)
+        ? '__'
+        : src.startsWith('~~', i)
+          ? '~~'
+          : null;
     if (pair) {
-      const end = src.indexOf(pair, i + 2);
+      const end = canOpenEmphasis(src, i, pair) ? src.indexOf(pair, i + 2) : -1;
       if (end !== -1) {
         flush();
         segs.push({
@@ -295,22 +328,41 @@ export function parseInline(src: string, defs?: Record<string, string>): InlineS
           srcStart: i + 2,
           rawStart: i,
           rawEnd: end + 2,
-          kind: pair === '**' ? 'strong' : 'del',
+          kind: pair === '~~' ? 'del' : 'strong',
         });
         i = end + 2;
         continue;
       }
     }
 
-    // 斜体
+    /**
+     * 斜体。
+     *
+     * 按 CommonMark 的 flanking 规则收紧，否则会把普通正文误判成强调：
+     *  - 开标记之后是空白或行尾 → 不是强调（`2 * 3 * 4` 里的星号是乘号）
+     *  - 闭标记之前是空白 → 不是强调
+     *  - `_` 不出现在词内 → 开标记前、闭标记后是字母数字时都不算
+     *    （`snake_case_name` 不能把 `case` 变成斜体）
+     */
     if (src[i] === '*' || src[i] === '_') {
       const mark = src[i];
-      const end = src.indexOf(mark, i + 1);
-      if (end !== -1 && end > i + 1) {
-        flush();
-        segs.push({ text: src.slice(i + 1, end), srcStart: i + 1, rawStart: i, rawEnd: end + 1, kind: 'em' });
-        i = end + 1;
-        continue;
+      const after = src[i + 1];
+      const canOpen = after !== undefined && !/\s/.test(after) && canOpenEmphasis(src, i, mark);
+      if (canOpen) {
+        let end = -1;
+        for (let j = i + 2; j < src.length; j++) {
+          if (src[j] !== mark) continue;
+          if (/\s/.test(src[j - 1])) continue;
+          if (mark === '_' && WORD_CHAR.test(src[j + 1] ?? '')) continue;
+          end = j;
+          break;
+        }
+        if (end !== -1) {
+          flush();
+          segs.push({ text: src.slice(i + 1, end), srcStart: i + 1, rawStart: i, rawEnd: end + 1, kind: 'em' });
+          i = end + 1;
+          continue;
+        }
       }
     }
 

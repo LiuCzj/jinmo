@@ -41,8 +41,9 @@ export function insertAt(text: string, caret: number, insert: string): EditOutco
 export function backspace(text: string, caret: number): EditOutcome {
   if (caret <= 0) return { text, caret: 0 };
 
-  const { index, start } = lineIndexOf(text, caret);
-  const line = text.split('\n')[index] ?? '';
+  const { start } = lineIndexOf(text, caret);
+  const nl = text.indexOf('\n', start);
+  const line = text.slice(start, nl === -1 ? text.length : nl);
   const lp = listPrefixOf(line);
 
   if (lp && caret === start) {
@@ -79,8 +80,9 @@ export function del(text: string, caret: number): EditOutcome {
  * @returns 新文本与新光标
  */
 export function enter(text: string, caret: number): EditOutcome {
-  const { index, start } = lineIndexOf(text, caret);
-  const line = text.split('\n')[index] ?? '';
+  const { start } = lineIndexOf(text, caret);
+  const nl = text.indexOf('\n', start);
+  const line = text.slice(start, nl === -1 ? text.length : nl);
   /**
    * 代码块里回车**只换行**，不做列表续行。
    *
@@ -104,30 +106,44 @@ export function enter(text: string, caret: number): EditOutcome {
 /**
  * 求光标所在行的行号与该行起始下标。
  *
+ * 每击键会被调用多次，故**不做 slice / split** —— 那会在长文档上产生成片的临时字符串。
+ * 行号靠逐个换行位置前进累加得到。
+ *
  * @param text 整篇 Markdown
  * @param caret 光标下标
  * @returns 0 基行号与行首下标
  */
 export function lineIndexOf(text: string, caret: number): { index: number; start: number } {
-  const before = text.slice(0, caret);
-  const start = before.lastIndexOf('\n') + 1;
-  return { index: before.split('\n').length - 1, start };
+  const p = Math.max(0, Math.min(caret, text.length));
+  const start = text.lastIndexOf('\n', p - 1) + 1;
+  let index = 0;
+  let at = text.indexOf('\n');
+  while (at !== -1 && at < start) {
+    index++;
+    at = text.indexOf('\n', at + 1);
+  }
+  return { index, start };
 }
 
 /**
  * 求某一一行行首或行尾的光标下标。
  *
  * @param text 整篇 Markdown
- * @param lineIndex 目标行号，0 基，越界时夹紧
+ * @param lineIndex 目标行号，0 基，越界时夹紧到最后一行
  * @param where 行首或行尾
  * @returns 光标下标
  */
 export function caretAtLineEdge(text: string, lineIndex: number, where: 'start' | 'end'): number {
-  const lines = text.split('\n');
-  const idx = Math.max(0, Math.min(lineIndex, lines.length - 1));
   let pos = 0;
-  for (let i = 0; i < idx; i++) pos += lines[i].length + 1;
-  return where === 'start' ? pos : pos + lines[idx].length;
+  for (let i = 0; i < lineIndex; i++) {
+    const nl = text.indexOf('\n', pos);
+    // 已经走到最后一行，再往下就是越界：夹紧
+    if (nl === -1) break;
+    pos = nl + 1;
+  }
+  if (where === 'start') return pos;
+  const nl = text.indexOf('\n', pos);
+  return nl === -1 ? text.length : nl;
 }
 
 /**
@@ -160,41 +176,6 @@ export function moveLine(text: string, caret: number, dir: -1 | 1): number {
  */
 export function moveChar(text: string, caret: number, dir: -1 | 1): number {
   return Math.max(0, Math.min(caret + dir, text.length));
-}
-
-/**
- * 按住 Shift 移动光标时求新的光标位置。
- *
- * 只返回新光标，选区锚点由调用方保存。
- *
- * @param text 整篇 Markdown
- * @param caret 光标下标
- * @param dir 移动方向
- * @param key 按下的方向键
- * @returns 光标下标
- */
-export function extendSelection(
-  text: string,
-  caret: number,
-  dir: -1 | 1,
-  key: 'left' | 'right' | 'up' | 'down' | 'home' | 'end',
-): number {
-  switch (key) {
-    case 'left':
-    case 'right':
-      return moveChar(text, caret, dir);
-    case 'up':
-    case 'down':
-      return moveLine(text, caret, key === 'up' ? -1 : 1);
-    case 'home': {
-      const { index } = lineIndexOf(text, caret);
-      return caretAtLineEdge(text, index, 'start');
-    }
-    case 'end': {
-      const { index } = lineIndexOf(text, caret);
-      return caretAtLineEdge(text, index, 'end');
-    }
-  }
 }
 
 /**

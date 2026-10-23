@@ -23,7 +23,7 @@ pnpm-debug.log*
 # 本地工作文件：只在本人机器上有意义，且常含本机绝对路径、参考副本、验证截图
 temp/
 cache/
-AGENT.md
+AGENTS.md
 # 以下两个文件已删除，规则保留：万一再建，也不会把本机路径提交上去
 DOWNLOADS.md
 requirements.txt

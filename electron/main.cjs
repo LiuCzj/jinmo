@@ -170,6 +170,23 @@ function saveWindowState() {
   writeJson(stateFile(), { ...bounds, maximized });
 }
 
+/** 延迟写盘的句柄 */
+let stateTimer = null;
+
+/**
+ * 延迟写窗口状态。
+ *
+ * `resize` / `move` 在拖动过程中每帧触发，同步 `writeFileSync` 会让拖窗口卡顿、并持续写盘；
+ * 停手 400ms 后写一次即可。`close` 前要立刻落盘，不能等这个定时器。
+ */
+function scheduleSaveWindowState() {
+  if (stateTimer) clearTimeout(stateTimer);
+  stateTimer = setTimeout(() => {
+    stateTimer = null;
+    saveWindowState();
+  }, 400);
+}
+
 function loadRecent() {
   const list = readJson(recentFile(), []);
   return Array.isArray(list) ? list.filter((p) => typeof p === 'string') : [];
@@ -308,6 +325,33 @@ function showAbout() {
   });
 }
 
+/**
+ * 等渲染进程报告「保存流程结束」，并取回是否真的写盘成功。
+ *
+ * 只靠 `dirty:set` 不行：用户取消「另存为」时 dirty 一直是 true，
+ * 主进程只能干等超时，然后误报「还没保存成功」。而且 `setDirty(false)` 是
+ * React effect 里异步生效的，信号到达时 dirty 可能还是旧值 ——
+ * 所以成败由信号自己带过来，不看 dirty。
+ *
+ * @param timeoutMs 兜底超时（防渲染进程卡死）
+ * @returns 是否保存成功；超时返回 false
+ */
+function waitForSaveResult(timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      ipcMain.off('save:settled', onSettled);
+      resolve(ok);
+    };
+    const onSettled = (_e, saved) => finish(saved === true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    ipcMain.on('save:settled', onSettled);
+  });
+}
+
 function createWindow() {
   const state = loadWindowState();
   win = new BrowserWindow({
@@ -331,12 +375,16 @@ function createWindow() {
   if (state.maximized) win.maximize();
   win.once('ready-to-show', () => win.show());
 
-  // 记录窗口状态
-  win.on('resize', saveWindowState);
-  win.on('move', saveWindowState);
+  // 记录窗口状态：拖动/缩放走防抖，最大化与关闭立即落盘
+  win.on('resize', scheduleSaveWindowState);
+  win.on('move', scheduleSaveWindowState);
   win.on('maximize', saveWindowState);
   win.on('unmaximize', saveWindowState);
-  win.on('close', saveWindowState);
+  win.on('close', () => {
+    if (stateTimer) clearTimeout(stateTimer);
+    stateTimer = null;
+    saveWindowState();
+  });
   win.on('close', async (e) => {
     if (allowClose) return;
     e.preventDefault();
@@ -355,10 +403,23 @@ function createWindow() {
     });
     if (response === 2) return;
     if (response === 0) {
-      // 交给渲染进程保存；等它把 dirty 清掉（最多 3 秒）
+      // 先挂监听再发命令，否则渲染进程可能先回话、信号被漏掉
+      const settledP = waitForSaveResult(60000);
       win?.webContents.send('menu', 'save');
-      for (let i = 0; i < 30 && dirty; i++) await new Promise((r) => setTimeout(r, 100));
-      if (dirty) return; // 保存失败或用户取消了另存为 → 不关
+      const saved = await settledP;
+      if (!saved) {
+        // 取消另存为 / 写盘失败 / 渲染进程没响应 ——
+        // 不能静默什么都不做，用户会以为程序卡死了
+        const again = await dialog.showMessageBox(win, {
+          type: 'warning',
+          buttons: ['仍然退出', '返回编辑'],
+          defaultId: 1,
+          cancelId: 1,
+          message: '文档还没有保存成功',
+          detail: '继续退出会丢失这次修改。',
+        });
+        if (again.response !== 0) return;
+      }
     }
     allowClose = true;
     win?.close();

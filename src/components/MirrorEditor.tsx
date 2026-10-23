@@ -17,8 +17,9 @@ import {
   useRef,
   useState,
 } from 'react';
-import { charColsForLine, classifyLine, parseInline, revealSegAt, type InlineSeg, type LineKind } from '@/lib/md-inline';
-import { parseFenceOptions, fenceLangOf, fenceAttrs, buildFenceLine } from '@/lib/code-langs';
+import { charColsForLine, revealSegAt, type InlineSeg, type LineKind } from '@/lib/md-inline';
+import { parseFenceOptions, fenceAttrs, buildFenceLine } from '@/lib/code-langs';
+import { createLineBuilder, lineIndexIn as lineIndexAtPos, type RenderLine } from '@/lib/md-lines';
 import { highlightCode } from '@/lib/md-code';
 import { highlightMarkdown } from '@/lib/md-highlight';
 import { renderMath } from '@/lib/md-math';
@@ -78,7 +79,6 @@ import {
   type FindHit,
   type InlineTarget,
   type Selection,
-  type TableAlign,
 } from '@/lib/md-commands';
 import {
   buildContextMenu,
@@ -98,37 +98,6 @@ import {
 import { FindBar, type FindState } from './FindBar';
 import { pickImages, readClipboard, writeClipboard } from '@/lib/platform';
 
-/** 一行的渲染描述 */
-interface RenderLine {
-  /** 这一行在整篇里的起始下标 */
-  start: number;
-  /** 这一行的源码（不含换行） */
-  src: string;
-  /** 块类型 */
-  kind: LineKind;
-  /** 前缀之后的可见片段 */
-  segs: InlineSeg[];
-  /** 前缀的源码文本（如 `## `），加虚化显示 */
-  prefixText: string;
-  /** 表格行的列数（取表头的列数，head/sep/body 三种行都有值） */
-  tableCols?: number;
-  /** 表格各列的对齐方式（取自分隔行；三种表格行都有值） */
-  tableAligns?: TableAlign[];
-  /** 代码块的语言标识，取自围栏后的第一个词；code 行与 fence 行都有 */
-  lang?: string;
-  /** 本行是代码块的开围栏（语言选择按钮挂在它上面） */
-  codeFence?: boolean;
-  /** 代码行要显示的行号（围栏属性 `{.numberLines}` 打开时才有；围栏行没有） */
-  codeNo?: number;
-  /** 块级公式的 TeX 源码；只挂在块的首行 */
-  mathTex?: string;
-  /** Mermaid 图表源码；只挂在块的首行 */
-  diagram?: string;
-  /** 块级内容（公式 / 图表）的起止行号；块内每一行都有 */
-  mathBlockFirst?: number;
-  mathBlockLast?: number;
-}
-
 /** 光标位置：整篇里的绝对字符下标 */
 type Caret = number;
 
@@ -143,9 +112,6 @@ interface CharMapEntry {
   /** 对应的行内源码下标；null = 装饰字符 */
   src: number | null;
 }
-
-/** 表格分隔行的形态：竖线、冒号、横杠、空格的组合，且至少含一个 `-` */
-const TABLE_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;
 
   /**
    * 支持语法浮现的行类型：段落、标题、引用、列表、分割线。
@@ -187,10 +153,6 @@ function sliceSegs(segs: InlineSeg[], from: number, to: number): InlineSeg[] {
   return out;
 }
 
-/** 上一轮 buildLines 的结果，用于复用没变的行对象 */
-let prevLines: RenderLine[] = [];
-let prevDefsKey = '';
-
 /**
  * 没有查找命中时的空数组。
  *
@@ -198,334 +160,23 @@ let prevDefsKey = '';
  */
 const NO_HITS: FindHit[] = [];
 
+/**
+ * 从后往前找第一个满足条件的元素。
+ *
+ * `[...arr].reverse().find(...)` 每次都会整表复制一份 —— 光标绘制每移动一次要跑两趟，
+ * 长行时这笔分配比查找本身还贵。
+ *
+ * @param arr 待查数组
+ * @param pred 条件
+ * @returns 命中的元素；没有时 undefined
+ */
+function findLast<T>(arr: T[], pred: (x: T) => boolean): T | undefined {
+  for (let i = arr.length - 1; i >= 0; i--) if (pred(arr[i])) return arr[i];
+  return undefined;
+}
+
 /** 不在源码模式时的空着色结果。同样是稳定引用，避免每次渲染都造一个新数组 */
 const EMPTY_HTML: string[] = [];
-
-/** 单行的解析结果。与「这一行在整篇里的位置」无关，因此可以跨次复用 */
-interface LineParse {
-  kind: LineKind;
-  segs: InlineSeg[];
-  prefixText: string;
-  lang?: string;
-  /** 本行是代码块的开围栏 */
-  codeFence?: boolean;
-}
-
-/**
- * 单行解析结果的缓存。
- *
- * 打字时只有一行变了，其余几百行的解析结果一模一样；整篇重解析是长文档下敲字变慢的原因之一。
- * 缓存结果同时让未变行的 `segs` / `kind` 保持同一个引用，行组件的记忆化才跳得掉（见 linePropsEqual）。
- *
- * 外层键是「围栏状态 + 引用定义」，内层键是行文本：
- *  - 围栏状态决定这一行算 fence 还是 code，同样的 ``` 在围栏内外是两种含义；
- *  - 引用定义决定 `[x][id]` 能否解析成链接，定义行改了所有引用行都要重算。
- * 两者不进键就会读到过期结果。做成两层是为了让内层键直接用行文本，
- * 免得每行都拼一个长字符串再哈希。
- */
-const parseCache = new Map<string, Map<string, LineParse>>();
-/** 缓存条目上限。超过就整个丢掉重建 —— 打字过程中产生的中间态行会不断堆积 */
-const PARSE_CACHE_MAX = 5000;
-let parseCacheEntries = 0;
-
-/**
- * 解析一行（行类型 + 可见片段 + 前缀），不涉及它在整篇里的位置。
- *
- * @param line 整行源码，不含换行
- * @param fence 进入这一行时的围栏标记；null = 不在围栏内
- * @param fenceLang 进入这一行时的围栏语言标识
- * @param defs 引用式链接的定义表
- * @returns 解析结果
- */
-function parseLine(line: string, fence: string | null, fenceLang: string, defs: Record<string, string>): LineParse {
-  const kind = classifyLine(line, fence);
-  const prefixText = line.slice(0, kind.prefixLen);
-  const body = line.slice(kind.prefixLen);
-  /**
-   * 片段下标需加上前缀长度：parseInline 收到的是去掉前缀的 body，
-   * 而光标换算用的是相对整行的列号。
-   */
-  let segs =
-    kind.type === 'code'
-      ? [
-          {
-            text: body,
-            srcStart: kind.prefixLen,
-            rawStart: kind.prefixLen,
-            rawEnd: kind.prefixLen + body.length,
-            kind: 'plain' as const,
-          },
-        ]
-      : parseInline(body, defs).map((s) => ({
-          ...s,
-          srcStart: s.srcStart + kind.prefixLen,
-          rawStart: s.rawStart + kind.prefixLen,
-          rawEnd: s.rawEnd + kind.prefixLen,
-        }));
-
-  // 任务列表：把行首的 `[ ] ` / `[x] ` 单独做成一个复选框片段，其余部分照常解析
-  if (kind.type === 'ul') {
-    const task = /^\[([ xX])\]\s+/.exec(body);
-    if (task) {
-      const shift = kind.prefixLen + task[0].length;
-      segs = [
-        {
-          text: task[0],
-          srcStart: kind.prefixLen,
-          rawStart: kind.prefixLen,
-          rawEnd: shift,
-          kind: 'task',
-          checked: task[1].toLowerCase() === 'x',
-        },
-        ...parseInline(body.slice(task[0].length), defs).map((s) => ({
-          ...s,
-          srcStart: s.srcStart + shift,
-          rawStart: s.rawStart + shift,
-          rawEnd: s.rawEnd + shift,
-        })),
-      ];
-    }
-  }
-
-  const lang =
-    kind.type === 'code'
-      ? fenceLang
-      : kind.type === 'fence'
-        ? fenceLangOf(line.slice((/^\s*/.exec(line)?.[0].length ?? 0) + (/^\s*(`{3,}|~{3,})/.exec(line)?.[1].length ?? 3)))
-        : undefined;
-
-  return { kind, segs, prefixText, lang };
-}
-
-/**
- * 把整篇切成一行的渲染描述。
- *
- * 逐行的解析结果走 `parseCache`，只有真的改过的那一行会重新解析；
- * 内容与起始位置都没变的行再复用上一轮的对象：行组件是记忆化的，
- * 对象引用不变它就跳过重渲染 —— 这是长文档下敲字跟手的关键。
- *
- * @param src 整篇 Markdown
- * @returns 逐行的渲染描述
- */
-function buildLines(src: string, globalLineNumbers = false): RenderLine[] {
-  const raw = src.split('\n');
-  const out: RenderLine[] = [];
-  let pos = 0;
-  /** 当前所处的代码围栏标记（如 ``` 或 ````）；null = 不在围栏内 */
-  let fence: string | null = null;
-  /** 当前代码围栏的语言标识 */
-  let fenceLang = '';
-  /** 当前代码块是否显示行号（来自围栏属性 `{.numberLines}`，见 parseFenceOptions） */
-  let fenceNoOn = false;
-  /** 当前代码块行号的起始编号（`startFrom="N"`，默认 1） */
-  let fenceNoFirst = 1;
-  /** 当前代码块已经数到第几行 */
-  let fenceNoCount = 0;
-
-  // 先收一遍引用式链接的定义行 `[id]: url`（脚注定义 `[^id]:` 不算）
-  const defs: Record<string, string> = {};
-  for (const line of raw) {
-    // 定义行必然以 `[` 开头；先做一次廉价判断，省掉整篇的正则
-    if (line.charCodeAt(0) !== 91) continue;
-    const m = /^\[([^\]^][^\]]*)\]:\s*(\S+)/.exec(line);
-    if (m) defs[m[1].trim().toLowerCase()] = m[2];
-  }
-  const defsSig = JSON.stringify(defs);
-
-  /** 当前缓存桶（外层键 = 围栏状态 + 引用定义）。围栏状态只在围栏边界变，故不必每行重算 */
-  let bucket: Map<string, LineParse> | null = null;
-  let bucketKey = '';
-
-  for (const line of raw) {
-    const fenceState = fence === null ? '' : `${fence}|${fenceLang}`;
-    const want = `${fenceState}\u0000${defsSig}`;
-    if (bucket === null || want !== bucketKey) {
-      bucketKey = want;
-      bucket = parseCache.get(want) ?? null;
-      if (bucket === null) {
-        bucket = new Map();
-        parseCache.set(want, bucket);
-      }
-    }
-    let parse = bucket.get(line);
-    if (parse === undefined) {
-      parse = parseLine(line, fence, fenceLang, defs);
-      if (parseCacheEntries >= PARSE_CACHE_MAX) {
-        parseCache.clear();
-        parseCacheEntries = 0;
-        bucket = new Map();
-        parseCache.set(bucketKey, bucket);
-      }
-      bucket.set(line, parse);
-      parseCacheEntries++;
-    }
-
-    /** 本行是代码块的开围栏 —— 语言选择按钮只挂在这一行上 */
-    const opensFence = parse.kind.type === 'fence' && fence === null;
-    if (parse.kind.type === 'fence') {
-      if (fence === null) {
-        // 开围栏：记下标记、语言与行号属性（闭围栏不动这几个值）
-        const indent = /^\s*/.exec(line)?.[0].length ?? 0;
-        fence = /^\s*(`{3,}|~{3,})/.exec(line)?.[1] ?? '```';
-        const info = line.slice(indent + fence.length);
-        // 语言必须用 fenceLangOf 取：`{.numberLines}` 这种纯属性串不是语言，
-        // 直接用 `\S+` 抓会把属性当成语言，关键字高亮整块失效
-        fenceLang = fenceLangOf(info);
-        const opts = parseFenceOptions(info);
-        // 全局开关优先；关掉时还能靠围栏属性 `{.numberLines}` 单独打开
-        fenceNoOn = globalLineNumbers || opts.lineNumbers === true;
-        fenceNoFirst = opts.firstLineNumber ?? 1;
-        fenceNoCount = 0;
-      } else {
-        fence = null;
-      }
-    }
-
-    /** 代码块里的内容行才编号；围栏本身不算一行 */
-    const codeNo =
-      parse.kind.type === 'code' && fenceNoOn ? fenceNoFirst + fenceNoCount++ : undefined;
-
-    out.push({
-      start: pos,
-      src: line,
-      kind: parse.kind,
-      prefixText: parse.prefixText,
-      segs: parse.segs,
-      lang: parse.lang,
-      codeFence: opensFence || undefined,
-      codeNo,
-    });
-    pos += line.length + 1;
-  }
-
-  markTables(out);
-
-  // 块级公式：$$ ... $$（可跨行）。整块渲染成一个公式，非编辑态下只占首行的高度
-  let openAt = -1;
-  let buf: string[] = [];
-  const closeBlock = (endIndex: number) => {
-    const first = out[openAt];
-    if (!first) return;
-    first.mathTex = buf.join('\n').trim();
-    for (let k = openAt; k <= endIndex; k++) {
-      out[k].mathBlockFirst = openAt;
-      out[k].mathBlockLast = endIndex;
-    }
-    openAt = -1;
-    buf = [];
-  };
-  for (let i = 0; i < out.length; i++) {
-    const t = out[i].src.trim();
-    if (openAt === -1) {
-      if (t === '$$') {
-        openAt = i;
-        buf = [];
-      } else if (t.length > 4 && t.startsWith('$$') && t.endsWith('$$')) {
-        out[i].mathTex = t.slice(2, -2).trim();
-        out[i].mathBlockFirst = i;
-        out[i].mathBlockLast = i;
-      }
-    } else if (t === '$$') {
-      closeBlock(i);
-    } else {
-      buf.push(out[i].src);
-    }
-  }
-
-  // 图表块：```mermaid 围栏里的内容整块渲染成一张图，非编辑态下只占首行高度
-  for (let i = 0; i < out.length; i++) {
-    const fence = out[i];
-    if (fence.kind.type !== 'fence' || fence.lang !== 'mermaid') continue;
-    const body: string[] = [];
-    let j = i + 1;
-    while (j < out.length && out[j].kind.type === 'code') {
-      body.push(out[j].src);
-      j++;
-    }
-    if (j >= out.length || out[j].kind.type !== 'fence') continue; // 没有闭合围栏，按普通代码块处理
-    fence.diagram = body.join('\n');
-    for (let k = i; k <= j; k++) {
-      out[k].mathBlockFirst = i;
-      out[k].mathBlockLast = j;
-    }
-    i = j;
-  }
-
-  // 复用没变的行对象（见函数注释）。引用定义变了就不复用，避免拿到过期的链接解析结果
-  const defsKey = JSON.stringify(defs);
-  const merged =
-    defsKey === prevDefsKey
-      ? out.map((l, i) => {
-          const p = prevLines[i];
-          if (!p || p.src !== l.src || p.start !== l.start) return l;
-          if (
-            p.kind.type !== l.kind.type ||
-            p.kind.prefixLen !== l.kind.prefixLen ||
-            p.kind.marker !== l.kind.marker
-          ) {
-            return l;
-          }
-          if (
-            p.lang !== l.lang ||
-            p.codeFence !== l.codeFence ||
-            p.codeNo !== l.codeNo ||
-            p.mathTex !== l.mathTex ||
-            p.diagram !== l.diagram ||
-            p.mathBlockFirst !== l.mathBlockFirst ||
-            p.mathBlockLast !== l.mathBlockLast ||
-            // 表格的列数 / 列对齐派生自**分隔行**，行自己的 src 没变时也会变。
-            // 不比较就会复用旧对象，表头行一直带着旧的对齐值（改完对齐表头不动，实测踩过）。
-            // 对齐是数组、每次都是新引用，所以按值比。
-            p.tableCols !== l.tableCols ||
-            (p.tableAligns?.join() ?? '') !== (l.tableAligns?.join() ?? '')
-          ) {
-            return l;
-          }
-          return p;
-        })
-      : out;
-  prevLines = merged;
-  prevDefsKey = defsKey;
-
-  return merged;
-}
-
-  /**
-   * 标记表格块：连续行含竖线且下一行为分隔行形态时，标为 tableHead / tableSep / tableBody。
-   * classifyLine 逐行判定无法看到下一行，故在此处按全文处理。
-   *
-   * @param lines buildLines 的产出，原地修改
-   */
-function markTables(lines: RenderLine[]): void {
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    if (l.kind.type !== 'p' || !l.src.includes('|')) continue;
-    const next = lines[i + 1];
-    if (!next || next.kind.type !== 'p' || !TABLE_SEP_RE.test(next.src) || !next.src.includes('-')) continue;
-
-    const cols = tableCellRanges(l.src).length;
-    // 列对齐写在分隔行上（`:---` / `:---:` / `---:`），三种表格行共用同一份
-    const aligns = tableAlignmentsOf(next.src);
-    if (typeof window !== 'undefined') {
-      (window as unknown as Record<string, unknown>).__dbgAligns = [
-        ...(((window as unknown as Record<string, unknown[]>).__dbgAligns as unknown[]) ?? []),
-        { sep: next.src, aligns },
-      ].slice(-6);
-    }
-    l.kind = { type: 'tableHead', prefixLen: 0 };
-    l.tableCols = cols;
-    l.tableAligns = aligns;
-    next.kind = { type: 'tableSep', prefixLen: 0 };
-    next.tableCols = cols;
-    next.tableAligns = aligns;
-    for (let j = i + 2; j < lines.length; j++) {
-      if (lines[j].kind.type !== 'p' || !lines[j].src.trimStart().startsWith('|')) break;
-      lines[j].kind = { type: 'tableBody', prefixLen: 0 };
-      lines[j].tableCols = cols;
-      lines[j].tableAligns = aligns;
-    }
-  }
-}
 
 /**
  * 这一行是不是代码块的一部分（开闭围栏行或代码行）。
@@ -555,10 +206,25 @@ const UNDO_MERGE_MS = 600;
 /** 撤销栈深度上限 */
 const UNDO_MAX = 200;
 
+/**
+ * 撤销栈的总字符预算（UTF-16 码元）。
+ *
+ * 每步存的是**整篇快照**：280KB 的文档 × 200 步就是 56MB，长文档下内存会一路涨到卡顿。
+ * 超出预算就从最旧的开始丢 —— 步数与内存同时封顶，小文档仍能拿到完整的 200 步。
+ */
+const UNDO_BUDGET = 8_000_000;
+
 /** 一次历史快照：那一步之后的光标位置要一起恢复 */
 interface HistoryEntry {
   text: string;
   caret: number;
+}
+
+/** 撤销栈：`index` 指向「当前」状态，`chars` 是全部快照的字符总数（用于内存封顶） */
+interface History {
+  entries: HistoryEntry[];
+  index: number;
+  chars: number;
 }
 
 /**
@@ -627,7 +293,13 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       return CODE_INDENT_SIZE_DEFAULT;
     }
   });
-  const lines = useMemo(() => buildLines(value, codeLineNumbers), [value, codeLineNumbers]);
+  /**
+   * 行构建器。每个实例一份 —— 解析缓存与上一轮的行数组都是私有的，
+   * 多窗口并排打开（`JINMO_DATA_DIR` + 不同端口）时不会互相污染。
+   */
+  const builderRef = useRef<ReturnType<typeof createLineBuilder> | null>(null);
+  builderRef.current ??= createLineBuilder();
+  const lines = useMemo(() => builderRef.current!.build(value, codeLineNumbers), [value, codeLineNumbers]);
   const [caret, setCaret] = useState<Caret>(0);
   /** 专注模式（F8）：只留当前块清晰，其余变淡 */
   const [focusMode, setFocusMode] = useState(false);
@@ -637,14 +309,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
    * 光标所在行下标，-1 表示未定位。
    * 同步推导而非 useState + useEffect，后者会慢一帧导致浮现闪烁。
    */
-  const caretLine = useMemo(() => {
-    if (lines.length === 0) return -1;
-    const li = lines.findIndex((l, i) => {
-      const next = lines[i + 1];
-      return caret >= l.start && (!next || caret < next.start);
-    });
-    return li === -1 ? lines.length - 1 : li;
-  }, [caret, lines]);
+  const caretLine = useMemo(() => lineIndexAtPos(lines, caret), [caret, lines]);
 
   /**
    * 专注模式下保持清晰的「当前块」行下标集合，其余行变淡。
@@ -736,11 +401,15 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     [lines],
   );
   /** 撤销栈：entries 是逐步快照，index 指向「当前」状态 */
-  const historyRef = useRef<{ entries: HistoryEntry[]; index: number }>({ entries: [], index: -1 });
+  const historyRef = useRef<History>({ entries: [], index: -1, chars: 0 });
   /** 上一次小编辑落栈的时刻（毫秒），配合 UNDO_MERGE_MS 判断要不要并入同一步 */
   const lastEditAt = useRef(0);
   /** 上一次小编辑的类别；「合并」只发生在同类相邻小编辑之间（打字连打 / 退格连删） */
   const lastKindRef = useRef<'input' | 'erase' | 'block'>('block');
+  /** 光标是否静止。静止才闪烁；正在输入时常亮（与系统光标一致） */
+  const [caretIdle, setCaretIdle] = useState(true);
+  /** 输入停止多久后恢复闪烁 */
+  const caretIdleTimer = useRef(0);
   /** 每行 DOM，用于点击时按坐标反查字符 */
   const lineEls = useRef<(HTMLDivElement | null)[]>([]);
   /** 光标竖线的位置（相对编辑区容器） */
@@ -773,6 +442,32 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     () => (find && find.query ? findAll(value, find.query, find.caseSensitive) : NO_HITS),
     [find, value],
   );
+
+  /**
+   * 命中按行分桶。
+   *
+   * 渲染每一行都要问「本行有哪些命中」。若在 `hitsForLine` 里直接遍历全部命中，
+   * 复杂度是 O(行数 × 命中数) —— 500 处命中 × 1000 行就是 50 万次比较，而且每帧都跑。
+   * 这里一次遍历分好桶，之后每行 O(1) 取，且取到的数组引用稳定（行组件的记忆化才跳得掉）。
+   */
+  const hitsByLine = useMemo(() => {
+    const map = new Map<number, { start: number; end: number }[]>();
+    if (findHits.length === 0 || lines.length === 0) return map;
+    for (const h of findHits) {
+      const from = lineIndexAtPos(lines, h.start);
+      const to = lineIndexAtPos(lines, Math.max(h.start, h.end - 1));
+      for (let li = from; li <= to; li++) {
+        const l = lines[li];
+        const lineEnd = l.start + l.src.length;
+        if (h.start >= lineEnd || h.end <= l.start) continue;
+        const hit = { start: Math.max(h.start, l.start) - l.start, end: Math.min(h.end, lineEnd) - l.start };
+        const arr = map.get(li);
+        if (arr) arr.push(hit);
+        else map.set(li, [hit]);
+      }
+    }
+    return map;
+  }, [findHits, lines]);
 
   /**
    * 把绝对字符下标换算成屏幕坐标（用于摆光标）。
@@ -815,7 +510,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
        * 若 col 已越过后半行，则画在「源码下标 < col 的最后一个可见字符」的右边缘。
        */
       const head = map.find((c) => c.src !== null && c.src >= col);
-      const prev = [...map].reverse().find((c) => c.src !== null && c.src < col);
+      const prev = findLast(map, (c) => c.src !== null && c.src < col);
       const cellOf = (e?: CharMapEntry) => e?.node.parentElement?.closest('[data-cell]') ?? null;
       /**
        * 表格里格尾的 `|` 不渲染：光标停在格尾时，「src ≥ col 的第一个可见字符」会是**下一格**的首字，
@@ -844,7 +539,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       }
 
       // 行尾：量最后一个有源码映射的字符，取右边缘
-      const tail = [...map].reverse().find((c) => c.src !== null);
+      const tail = findLast(map, (c) => c.src !== null);
       if (tail) {
         const len = (tail.node.nodeValue ?? '').length;
         const r = document.createRange();
@@ -1070,16 +765,28 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         now - lastEditAt.current < UNDO_MERGE_MS &&
         h.entries[h.index] !== undefined;
       if (merged) {
+        h.chars += r.text.length - h.entries[h.index].text.length;
         h.entries[h.index] = { text: r.text, caret: r.caret };
       } else {
-        // 另起一步：丢弃当前状态之后的重做分支
-        h.entries = h.entries.slice(0, h.index + 1);
+        // 另起一步：丢弃当前状态之后的重做分支（原地截断，比 slice 少一次数组拷贝）
+        h.entries.length = h.index + 1;
+        h.chars = 0;
+        for (const e of h.entries) h.chars += e.text.length;
         h.entries.push({ text: r.text, caret: r.caret });
-        if (h.entries.length > UNDO_MAX) h.entries.shift();
+        h.chars += r.text.length;
+        // 步数与内存双重封顶：任何一项超了就丢最旧的一步
+        while (h.entries.length > UNDO_MAX || (h.chars > UNDO_BUDGET && h.entries.length > 1)) {
+          h.chars -= h.entries[0].text.length;
+          h.entries.shift();
+        }
         h.index = h.entries.length - 1;
       }
       lastEditAt.current = now;
       lastKindRef.current = kind;
+      // 正在输入时光标不闪（与系统光标一致），停手 600ms 后恢复闪烁
+      setCaretIdle(false);
+      if (caretIdleTimer.current) clearTimeout(caretIdleTimer.current);
+      caretIdleTimer.current = window.setTimeout(() => setCaretIdle(true), 600);
       onChange(r.text);
       setCaret(r.caret);
       /**
@@ -1129,10 +836,18 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     if (!top || top.text !== value) {
       h.entries = [{ text: value, caret }];
       h.index = 0;
+      h.chars = value.length;
       lastEditAt.current = 0;
       lastKindRef.current = 'block';
     }
   }, [value, caret]);
+
+  /** 卸载时清掉光标闪烁的定时器 */
+  useEffect(() => {
+    return () => {
+      if (caretIdleTimer.current) clearTimeout(caretIdleTimer.current);
+    };
+  }, []);
 
   /** 当前选区（没有选中时 start === end === caret） */
   const currentSelection = useCallback((): Selection => {
@@ -1153,10 +868,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       setCaret(h.end);
       setFindIndex(i);
       requestAnimationFrame(() => {
-        const li = lines.findIndex((l, k) => {
-          const next = lines[k + 1];
-          return h.start >= l.start && (!next || h.start < next.start);
-        });
+        const li = lineIndexAtPos(lines, h.start);
         if (li >= 0) lineEls.current[li]?.scrollIntoView({ block: 'center' });
       });
     },
@@ -1261,22 +973,26 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   /**
    * 找光标所在代码块的起止行号。
    *
+   * 直接读 `lines` 里已判定好的 `fence` 行 —— 不必再 `value.split('\n')` 切一遍全文
+   * 再用正则逐行试（每次右键/命令都做一次全文切分，长文档下很贵）。
+   *
    * @param from 起始查找的行号（一般是光标所在行）
    * @returns 开围栏行号与闭围栏行号；找不到开围栏时都是 -1，没有闭围栏时 close 为 -1
    */
   const codeBlockRangeAt = (from: number): { open: number; close: number } => {
-    const all = value.split('\n');
+    if (lines.length === 0) return { open: -1, close: -1 };
+    const at = Math.min(Math.max(from, 0), lines.length - 1);
     let open = -1;
-    for (let i = from; i >= 0; i--) {
-      if (/^\s*(?:`{3,}|~{3,})/.test(all[i])) {
+    for (let i = at; i >= 0; i--) {
+      if (lines[i].kind.type === 'fence') {
         open = i;
         break;
       }
     }
     if (open === -1) return { open: -1, close: -1 };
     let close = -1;
-    for (let i = open + 1; i < all.length; i++) {
-      if (/^\s*(?:`{3,}|~{3,})/.test(all[i])) {
+    for (let i = open + 1; i < lines.length; i++) {
+      if (lines[i].kind.type === 'fence') {
         close = i;
         break;
       }
@@ -1583,19 +1299,17 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           let at = s.start;
           let end = s.end;
           let text = t;
-          const all = value.split('\n');
           const li = lineIndexOf(value, s.start).index;
-          const isFence = (l: string) => /^\s*(?:`{3,}|~{3,})/.test(l);
-          if (li >= 0 && li < all.length && isFence(all[li])) {
-            const before = all.slice(0, li).filter(isFence).length;
+          // 围栏行已由 buildLines 判定好，不必再切分全文用正则逐行试
+          if (li >= 0 && li < lines.length && lines[li].kind.type === 'fence') {
+            let before = 0;
+            for (let i = 0; i < li; i++) if (lines[i].kind.type === 'fence') before++;
             const targetLine = before % 2 === 0 ? li + 1 : li;
-            if (targetLine < all.length) {
-              let p = 0;
-              for (let i = 0; i < targetLine; i++) p += all[i].length + 1;
-              at = p;
-              end = p;
+            if (targetLine < lines.length) {
+              at = lines[targetLine].start;
+              end = at;
               // 目标行本身有内容时补一个换行，别把新内容粘到原代码行上
-              if (all[targetLine] !== '') text = t + '\n';
+              if (lines[targetLine].src !== '') text = t + '\n';
             }
           }
           applyEdit({
@@ -1747,7 +1461,6 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           return;
         }
 
-        const all = value.split('\n');
         const { open, close } = codeBlockRangeAt(lineIndexOf(value, caret).index);
         if (open === -1) return;
 
@@ -1764,10 +1477,15 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           return;
         }
 
-        const lastLine = close === -1 ? all.length : close;
+        const lastLine = close === -1 ? lines.length : close;
         if (id === 'code-copy') {
           navigator.clipboard
-            .writeText(all.slice(open + 1, lastLine).join('\n'))
+            .writeText(
+              lines
+                .slice(open + 1, lastLine)
+                .map((l) => l.src)
+                .join('\n'),
+            )
             .catch(() => window.alert('浏览器拒绝了剪贴板权限'));
           return;
         }
@@ -1775,7 +1493,7 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         if (close === -1) {
           const next = value + (value.endsWith('\n') ? '' : '\n');
           applyEdit({ text: next, caret: next.length });
-        } else if (close + 1 < all.length) {
+        } else if (close + 1 < lines.length) {
           applyEdit({ text: value, caret: caretAtLineEdge(value, close + 1, 'start') });
         } else {
           const next = value + '\n';
@@ -1907,7 +1625,19 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
        * 所以**列号仍要自己算**：在该视觉行范围内，按点击点落在字符中点的哪一侧决定 before/after。
        * 两个都失败（旧内核、点到行外）时才退回纯手算。
        */
-      const nativeBand = (): { top: number; bottom: number } | null => {
+      /** 行元素的视口矩形；nativeHit 里要用，必须先于它声明 */
+      const elBox = el?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
+
+      /**
+       * 用浏览器原生的 `caretRangeFromPoint` 定位。
+       *
+       * 它按「视觉行 + X」命中，折行、缩进、等宽字体全都自动对上；
+       * 但它会吸附到最近的字符**边界**（点在字右半边仍返回字前），所以列号还得自己算。
+       * 有它就能把「逐字符测量」缩到命中点附近的几个字符。
+       *
+       * @returns 命中的文本节点、偏移与那一个字符的矩形；拿不到时 null
+       */
+      const nativeHit = (): { node: Text; offset: number; rect: DOMRect } | null => {
         if (clientY === undefined || !el) return null;
         // 点必须真的落在这个行元素上，否则会命中隔壁行
         if (clientX < elBox.left || clientX > elBox.right || clientY < elBox.top || clientY > elBox.bottom)
@@ -1932,37 +1662,83 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           }
         }
         if (!node || node.nodeType !== Node.TEXT_NODE) return null;
-        // 用命中的那个字符圈出「视觉行」的上下界
-        const hit = map.find((c) => c.node === node && c.offset === offset);
-        const anchor = hit ?? map.find((c) => c.node === node);
-        if (!anchor) return null;
+        const text = node as Text;
+        const len = (text.nodeValue ?? '').length;
+        if (len === 0) return null;
+        // 命中位置可能落在节点末尾（offset === len），夹到最后一个字符上量
         const r = document.createRange();
-        r.setStart(anchor.node, Math.min(anchor.offset, (anchor.node.nodeValue ?? '').length - 1));
-        r.setEnd(r.startContainer, Math.min(anchor.offset + 1, (anchor.node.nodeValue ?? '').length));
-        const rr = r.getBoundingClientRect();
-        if (!rr.height && !rr.width) return null;
-        // 上下各放 3px 容差，紧贴视觉行边缘点击时不至于掉进相邻视觉行
-        return { top: rr.top - 3, bottom: rr.bottom + 3 };
+        r.setStart(text, Math.min(offset, len - 1));
+        r.setEnd(text, Math.min(offset + 1, len));
+        const rect = r.getBoundingClientRect();
+        if (!rect.height && !rect.width) return null;
+        return { node: text, offset, rect };
       };
-
-      const elBox = el?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
 
       if (line.kind.type !== 'hr' && map.length) {
         const clickRel = clientX - wr.left;
-        /**
-         * 第一遍：锁定视觉行。
-         * 优先用浏览器原生命中（折行、缩进、等宽字体全都自动对上），
-         * 拿不到就退回「按 Y 找最近字符」。
-         */
-        let bandTop = Number.NEGATIVE_INFINITY;
-        let bandBottom = Number.POSITIVE_INFINITY;
-        const native = nativeBand();
-        if (native) {
-          bandTop = native.top;
-          bandBottom = native.bottom;
-        } else if (clientY !== undefined) {
-          let bestDy = Number.POSITIVE_INFINITY;
-          let bestRect: DOMRect | null = null;
+        const nh = nativeHit();
+        let placed = false;
+
+        if (nh) {
+          /**
+           * 只测命中点附近的几个字符。
+           *
+           * 原生命中给出的是「最近的字符边界」，真正要选的字符就在它前后一两个之内。
+           * 整行逐字符测量在 200 字的行上要跑 200 次 Range + getBoundingClientRect，
+           * 点击会明显发涩（每次测量都是一次布局查询）。
+           */
+          let base = map.findIndex((c) => c.node === nh.node && c.offset === nh.offset);
+          if (base === -1) base = map.findIndex((c) => c.node === nh.node);
+          if (base !== -1) {
+            let bestDist = Number.POSITIVE_INFINITY;
+            for (let k = base - 2; k <= base + 2; k++) {
+              const c = map[k];
+              if (!c || c.src === null) continue;
+              const r = document.createRange();
+              r.setStart(c.node, c.offset);
+              r.setEnd(c.node, c.offset + 1);
+              const rr = r.getBoundingClientRect();
+              if (!rr.width) continue;
+              // 必须落在原生给出的视觉行内（上下 3px 容差），折行时才不会跨视觉行抓错
+              if (rr.bottom < nh.rect.top - 3 || rr.top > nh.rect.bottom + 3) continue;
+              const mid = rr.left + rr.width / 2 - wr.left;
+              const d = Math.abs(mid - clickRel);
+              if (d < bestDist) {
+                bestDist = d;
+                next = line.start + c.src + (clickRel > mid ? 1 : 0);
+                placed = true;
+              }
+            }
+          }
+        }
+
+        // 原生不可用（旧内核 / 点到文本节点之间的空隙）→ 退回逐字符扫描
+        if (!placed) {
+          let bandTop = Number.NEGATIVE_INFINITY;
+          let bandBottom = Number.POSITIVE_INFINITY;
+          if (clientY !== undefined) {
+            let bestDy = Number.POSITIVE_INFINITY;
+            let bestRect: DOMRect | null = null;
+            for (const c of map) {
+              if (c.src === null) continue;
+              const r = document.createRange();
+              r.setStart(c.node, c.offset);
+              r.setEnd(c.node, c.offset + 1);
+              const rr = r.getBoundingClientRect();
+              if (!rr.width) continue;
+              const dy = Math.abs(rr.top + rr.height / 2 - clientY);
+              if (dy < bestDy) {
+                bestDy = dy;
+                bestRect = rr;
+              }
+            }
+            if (bestRect) {
+              bandTop = bestRect.top - 2;
+              bandBottom = bestRect.bottom + 2;
+            }
+          }
+          // 视觉行内按 X 找最近字符。点左半边落在字前、右半边落在字后
+          let bestDist = Number.POSITIVE_INFINITY;
           for (const c of map) {
             if (c.src === null) continue;
             const r = document.createRange();
@@ -1970,32 +1746,13 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
             r.setEnd(c.node, c.offset + 1);
             const rr = r.getBoundingClientRect();
             if (!rr.width) continue;
-            const dy = Math.abs(rr.top + rr.height / 2 - clientY);
-            if (dy < bestDy) {
-              bestDy = dy;
-              bestRect = rr;
+            if (rr.bottom < bandTop || rr.top > bandBottom) continue;
+            const mid = rr.left + rr.width / 2 - wr.left;
+            const d = Math.abs(mid - clickRel);
+            if (d < bestDist) {
+              bestDist = d;
+              next = line.start + c.src + (clickRel > mid ? 1 : 0);
             }
-          }
-          if (bestRect) {
-            bandTop = bestRect.top - 2;
-            bandBottom = bestRect.bottom + 2;
-          }
-        }
-        // 第二遍：视觉行内按 X 找最近字符。点左半边落在字前、右半边落在字后
-        let bestDist = Number.POSITIVE_INFINITY;
-        for (const c of map) {
-          if (c.src === null) continue;
-          const r = document.createRange();
-          r.setStart(c.node, c.offset);
-          r.setEnd(c.node, c.offset + 1);
-          const rr = r.getBoundingClientRect();
-          if (!rr.width) continue;
-          if (rr.bottom < bandTop || rr.top > bandBottom) continue;
-          const mid = rr.left + rr.width / 2 - wr.left;
-          const d = Math.abs(mid - clickRel);
-          if (d < bestDist) {
-            bestDist = d;
-            next = line.start + c.src + (clickRel > mid ? 1 : 0);
           }
         }
       }
@@ -2640,7 +2397,10 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   );
 
   /**
-   * 编辑区空白处按下：光标落到文末；末尾不是空行就先补一行。
+   * 编辑区空白处按下：把光标放到文末。
+   *
+   * 只挪光标、**不改文档** —— 以前这里会补一个换行，点一下空白处文档就被标脏
+   * （关窗弹「有未保存的修改」），而用户只是想把光标挪到最后。
    *
    * 点在行上时不插手 —— 那种情况交给行自己的处理函数（按坐标反查落点）。
    * 只处理左键：右键走 onBackgroundContextMenu，在这里改文档会让右键凭空多出一个换行。
@@ -2660,13 +2420,8 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
     inputRef.current?.focus();
     if ((e.target as HTMLElement).closest('.cursor-text')) return;
     e.preventDefault();
-    if (value === '') return;
-    if (value.endsWith('\n')) {
-      setAnchor(null);
-      setCaret(value.length);
-    } else {
-      applyEdit({ text: value + '\n', caret: value.length + 1 });
-    }
+    setAnchor(null);
+    setCaret(value.length);
   };
 
   /**
@@ -2771,27 +2526,14 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
   /**
    * 取某一行的查找命中（转成行内列号）。
    *
+   * 结果由 `hitsByLine` 预先分好桶，这里只做一次 Map 查询。
    * 在父组件算而不是让行组件自己算：行组件要凭「没有命中」这个稳定结果跳过重渲染，
    * 一旦它自己去读 `line.start`，父组件就没法把 `start` 从比较里摘出去（见 linePropsEqual）。
    *
    * @param li 行下标
    * @returns 本行的命中范围（行内列号）；没有命中时返回同一个空数组引用
    */
-  const hitsForLine = (li: number): { start: number; end: number }[] => {
-    if (findHits.length === 0) return NO_HITS;
-    const l = lines[li];
-    if (!l) return NO_HITS;
-    const lineEnd = l.start + l.src.length;
-    const out: { start: number; end: number }[] = [];
-    for (const h of findHits) {
-      if (h.start >= lineEnd || h.end <= l.start) continue;
-      out.push({
-        start: Math.max(h.start, l.start) - l.start,
-        end: Math.min(h.end, lineEnd) - l.start,
-      });
-    }
-    return out.length ? out : NO_HITS;
-  };
+  const hitsForLine = (li: number): { start: number; end: number }[] => hitsByLine.get(li) ?? NO_HITS;
 
   /**
    * 源码模式：把着色层的滚动同步到 textarea。
@@ -2898,34 +2640,94 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
    * @param inFence 本行是否在代码块容器内（容器已画边框，行不再自己补边）
    * @returns 行元素
    */
+  /**
+   * 行元素的缓存。
+   *
+   * `React.createElement` 每行每次要 ~5μs，1442 行就是 7ms/击键 —— 实测这是最大的一笔开销，
+   * 比解析本身贵 20 倍。行组件的 `memo` 只能省掉「组件函数执行」，省不掉 `createElement`
+   * 和 props 对象的创建；所以在调用 `createElement` **之前**先按 props 判断能否复用旧 element，
+   * 复用后 React 见到同一个引用会直接 bailout。
+   *
+   * ⚠️ 给 `EditorLine` 加 prop 时必须同步这里的比较，否则该行会一直显示旧内容。
+   */
+  const elemCache = useRef<
+    {
+      el: React.ReactElement;
+      line: RenderLine;
+      editing: boolean;
+      mathEditing: boolean;
+      dimmed: boolean;
+      isTableLast: boolean;
+      isCodeFirst: boolean;
+      isCodeLast: boolean;
+      selStart: number;
+      selEnd: number;
+      caretCol: number;
+      preedit: string;
+      lineHits: { start: number; end: number }[];
+      gap: boolean;
+    }[]
+  >([]);
+
   const renderLine = (i: number, inFence: boolean, gap = false) => {
     const l = lines[i];
     if (!l) return null;
-    return (
+
+    const editing = isEditingLine(i);
+    const mathEditing =
+      l.mathBlockFirst !== undefined &&
+      caretLine >= (l.mathBlockFirst ?? 0) &&
+      caretLine <= (l.mathBlockLast ?? 0);
+    const dimmed = !!(focusMode && focusBlock && !focusBlock.has(i));
+    const isTableLast =
+      (l.kind.type === 'tableHead' || l.kind.type === 'tableBody') &&
+      lines[i + 1]?.kind.type !== 'tableBody' &&
+      lines[i + 1]?.kind.type !== 'tableSep';
+    const isCodeFirst = !inFence && isCodeLike(lines, i) && !isCodeLike(lines, i - 1);
+    const isCodeLast = !inFence && isCodeLike(lines, i) && !isCodeLike(lines, i + 1);
+    const selStart = selLo === null ? 0 : selLo - l.start;
+    const selEnd = selHi === null ? 0 : selHi - l.start;
+    const caretCol = i === caretLine ? caret - l.start : -1;
+    const pre = i === caretLine ? preedit : '';
+    const lineHits = hitsForLine(i);
+
+    const c = elemCache.current[i];
+    if (
+      c &&
+      c.line === l &&
+      c.editing === editing &&
+      c.mathEditing === mathEditing &&
+      c.dimmed === dimmed &&
+      c.isTableLast === isTableLast &&
+      c.isCodeFirst === isCodeFirst &&
+      c.isCodeLast === isCodeLast &&
+      c.selStart === selStart &&
+      c.selEnd === selEnd &&
+      c.caretCol === caretCol &&
+      c.preedit === pre &&
+      c.lineHits === lineHits &&
+      c.gap === gap
+    ) {
+      return c.el;
+    }
+
+    const el = (
       <EditorLine
         key={i}
         line={l}
         index={i}
         gap={gap}
-        editing={isEditingLine(i)}
-        mathEditing={
-          l.mathBlockFirst !== undefined &&
-          caretLine >= (l.mathBlockFirst ?? 0) &&
-          caretLine <= (l.mathBlockLast ?? 0)
-        }
-        dimmed={!!(focusMode && focusBlock && !focusBlock.has(i))}
-        isTableLast={
-          (l.kind.type === 'tableHead' || l.kind.type === 'tableBody') &&
-          lines[i + 1]?.kind.type !== 'tableBody' &&
-          lines[i + 1]?.kind.type !== 'tableSep'
-        }
-        isCodeFirst={!inFence && isCodeLike(lines, i) && !isCodeLike(lines, i - 1)}
-        isCodeLast={!inFence && isCodeLike(lines, i) && !isCodeLike(lines, i + 1)}
-        selStart={selLo === null ? 0 : selLo - l.start}
-        selEnd={selHi === null ? 0 : selHi - l.start}
-        caretCol={i === caretLine ? caret - l.start : -1}
-        preedit={i === caretLine ? preedit : ''}
-        lineHits={hitsForLine(i)}
+        editing={editing}
+        mathEditing={mathEditing}
+        dimmed={dimmed}
+        isTableLast={isTableLast}
+        isCodeFirst={isCodeFirst}
+        isCodeLast={isCodeLast}
+        selStart={selStart}
+        selEnd={selEnd}
+        caretCol={caretCol}
+        preedit={pre}
+        lineHits={lineHits}
         onLineClick={stableLineClick}
         onLineMouseDown={stableLineMouseDown}
         onContextMenu={stableContextMenu}
@@ -2934,6 +2736,23 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
         registerLine={registerLine}
       />
     );
+    elemCache.current[i] = {
+      el,
+      line: l,
+      editing,
+      mathEditing,
+      dimmed,
+      isTableLast,
+      isCodeFirst,
+      isCodeLast,
+      selStart,
+      selEnd,
+      caretCol,
+      preedit: pre,
+      lineHits,
+      gap,
+    };
+    return el;
   };
 
   /**
@@ -2950,9 +2769,12 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
       if (isCodeLike(lines, i)) {
         let j = i;
         while (j + 1 < lines.length && isCodeLike(lines, j + 1)) j++;
+        // 用循环收集，别为拿索引先 slice 一份子数组
+        const kids: React.ReactNode[] = [];
+        for (let k = i; k <= j; k++) kids.push(renderLine(k, true));
         out.push(
           <div key={`f${i}`} className="md-fences">
-            {lines.slice(i, j + 1).map((_, k) => renderLine(i + k, true))}
+            {kids}
           </div>,
         );
         /**
@@ -3178,10 +3000,11 @@ const MirrorEditor = forwardRef<EditorHandle, MirrorEditorProps>(function Mirror
           `lineEls.current` 的下标与 `lines` 一一对应，光标定位与右键落点不受影响。
         */}
         {renderBlocks()}
-        {caretBox && (
+        {/* 未聚焦时不画光标：失焦后还留一条竖线会让人以为还能接着输入 */}
+        {focused && caretBox && (
           <div
             className={`pointer-events-none absolute w-[2px] bg-accent ${
-              focused && !composing ? 'animate-pulse' : ''
+              caretIdle && !composing ? 'md-caret-blink' : ''
             }`}
             style={{ left: caretBox.x, top: caretBox.y, height: caretBox.h }}
           />
@@ -3659,6 +3482,8 @@ const EditorLine = memo(function EditorLine({
     <div
       ref={(el) => registerLine(i, el)}
       data-li={i}
+      /** 块类型：CSS 用它给 `contain-intrinsic-size` 选更贴近的估算值（见 index.css） */
+      data-kind={l.kind.type}
       onClick={(e) => onLineClick(i, e)}
       onMouseDown={(e) => onLineMouseDown(i, e)}
       onContextMenu={(e) => onContextMenu(e, i)}

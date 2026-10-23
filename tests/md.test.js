@@ -17,6 +17,7 @@ const cmd = require('./build/md-commands.js');
 const hl = require('./build/md-highlight.js');
 const code = require('./build/md-code.js');
 const langs = require('./build/code-langs.js');
+const lines = require('./build/md-lines.js');
 
 let passed = 0;
 let failed = 0;
@@ -748,6 +749,183 @@ it('tableMoveColumn: 已在最左列时返回 null', () => {
 
 it('tableTabTarget: 不在表格里返回 null', () => {
   assert.strictEqual(cmd.tableTabTarget('普通段落', 1, 1), null);
+});
+
+console.log('\n[md-lines] 逐行模型：增量重建必须与全量重建完全一致');
+
+/**
+ * 把行数组压成可深度比较的纯数据。
+ * 只保留会进 DOM / 影响交互的字段，`start` 也要比 —— 增量重建靠平移它。
+ */
+function snap(lines) {
+  return lines.map((l) => ({
+    start: l.start,
+    src: l.src,
+    kind: l.kind.type,
+    prefixLen: l.kind.prefixLen,
+    marker: l.kind.marker,
+    prefixText: l.prefixText,
+    segs: l.segs.map((s) => [s.text, s.srcStart, s.rawStart, s.rawEnd, s.kind, s.href, s.checked, s.htmlTag]),
+    lang: l.lang,
+    codeFence: l.codeFence,
+    codeNo: l.codeNo,
+    tableCols: l.tableCols,
+    tableAligns: l.tableAligns,
+    mathTex: l.mathTex,
+    diagram: l.diagram,
+    mathBlockFirst: l.mathBlockFirst,
+    mathBlockLast: l.mathBlockLast,
+  }));
+}
+
+/** 线性同余伪随机，固定种子保证可复现 */
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+/** 造一份混了各种块结构的文档 */
+function makeDoc(rng) {
+  const parts = [];
+  const n = 12 + Math.floor(rng() * 10);
+  for (let i = 0; i < n; i++) {
+    const k = Math.floor(rng() * 10);
+    if (k === 0) parts.push('## 标题 ' + i);
+    else if (k === 1) parts.push('```js');
+    else if (k === 2) parts.push('const a = ' + i + ';');
+    else if (k === 3) parts.push('```');
+    else if (k === 4) parts.push('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+    else if (k === 5) parts.push('$$\nx^2 + ' + i + '\n$$');
+    else if (k === 6) parts.push('```mermaid\ngraph TD; A-->B\n```');
+    else if (k === 7) parts.push('- [ ] 待办 ' + i);
+    else if (k === 8) parts.push('> 引用 ' + i + ' 带 [链接](https://e.com/' + i + ')');
+    else parts.push('段落 ' + i + '，带 **粗体** 与 `代码` 和 [引用式][r' + i + ']。');
+  }
+  parts.push('[r0]: https://example.com/0');
+  return parts.join('\n');
+}
+
+/** 随机改一处：插入或删除 1~3 个字符 */
+const EDIT_ALPHABET = ['a', '中', '\n', '|', '`', '$', ' ', '-', '#', '*', '[', ']', '(', ')', '~', '='];
+function randomEdit(doc, rng) {
+  const pos = Math.floor(rng() * (doc.length + 1));
+  if (rng() < 0.45 && doc.length > 0) {
+    const n = 1 + Math.floor(rng() * 3);
+    return doc.slice(0, pos) + doc.slice(Math.min(doc.length, pos + n));
+  }
+  const n = 1 + Math.floor(rng() * 3);
+  let ins = '';
+  for (let i = 0; i < n; i++) ins += EDIT_ALPHABET[Math.floor(rng() * EDIT_ALPHABET.length)];
+  return doc.slice(0, pos) + ins + doc.slice(pos);
+}
+
+it('md-lines: 增量重建与全量重建结果逐字段一致（随机 300 步）', () => {
+  const rng = makeRng(20261023);
+  let doc = makeDoc(rng);
+  const inc = lines.createLineBuilder();
+  inc.build(doc, false);
+  for (let step = 0; step < 300; step++) {
+    doc = randomEdit(doc, rng);
+    const got = inc.build(doc, false);
+    const want = lines.createLineBuilder().build(doc, false);
+    assert.deepStrictEqual(snap(got), snap(want), `第 ${step} 步不一致\n--- 文档 ---\n${doc}`);
+  }
+});
+
+it('md-lines: 代码块内打字（围栏状态不能串）', () => {
+  const inc = lines.createLineBuilder();
+  let doc = '# t\n\n```js\nconst a = 1;\n```\n\n尾段';
+  inc.build(doc);
+  const at = doc.indexOf('const a') + 6;
+  doc = doc.slice(0, at) + 'X' + doc.slice(at);
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 在围栏行上加字符（开/闭围栏判定翻转）', () => {
+  const inc = lines.createLineBuilder();
+  let doc = 'a\n\n```\ncode\n```\n\nb';
+  inc.build(doc);
+  // 把闭围栏改成四反引号，开围栏仍是三反引号 → 闭不上了
+  const at = doc.lastIndexOf('```');
+  doc = doc.slice(0, at) + '`' + doc.slice(at);
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 插入新围栏行（后续行全部变 code）', () => {
+  const inc = lines.createLineBuilder();
+  let doc = 'a\nb\nc\nd';
+  inc.build(doc);
+  doc = 'a\n```\nb\nc\nd';
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 表格行内打字（列数 / 对齐跟着变）', () => {
+  const inc = lines.createLineBuilder();
+  let doc = '| a | b |\n| --- | --- |\n| 1 | 2 |\n\n尾';
+  inc.build(doc);
+  const at = doc.indexOf('| 1 |') + 3;
+  doc = doc.slice(0, at) + 'X' + doc.slice(at);
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 改动把段落变成表格（下一行是分隔行）', () => {
+  const inc = lines.createLineBuilder();
+  let doc = '段落\n| --- |\n尾';
+  inc.build(doc);
+  doc = '段落 | x\n| --- |\n尾';
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 公式块内打字', () => {
+  const inc = lines.createLineBuilder();
+  let doc = '前\n$$\nx^2\n$$\n后';
+  inc.build(doc);
+  const at = doc.indexOf('x^2') + 1;
+  doc = doc.slice(0, at) + 'y' + doc.slice(at);
+  assert.deepStrictEqual(snap(inc.build(doc)), snap(lines.createLineBuilder().build(doc)));
+});
+
+it('md-lines: 行号开关切换后结果正确', () => {
+  const doc = '```js{.numberLines}\na\nb\n```\n\n```\nc\n```';
+  const inc = lines.createLineBuilder();
+  const on = inc.build(doc, true);
+  const off = inc.build(doc, false);
+  assert.deepStrictEqual(snap(on), snap(lines.createLineBuilder().build(doc, true)));
+  assert.deepStrictEqual(snap(off), snap(lines.createLineBuilder().build(doc, false)));
+  // 全局开时两个代码块都显示行号，且各自从 1 计数
+  assert.deepStrictEqual(
+    on.filter((l) => l.codeNo !== undefined).map((l) => l.codeNo),
+    [1, 2, 1],
+  );
+  // 全局关时只有带 `{.numberLines}` 属性的那个块显示
+  assert.deepStrictEqual(
+    off.filter((l) => l.codeNo !== undefined).map((l) => l.codeNo),
+    [1, 2],
+  );
+});
+
+it('md-lines: 文首插入一个字，后续行 start 整体平移', () => {
+  const inc = lines.createLineBuilder();
+  let doc = 'aa\nbb\ncc';
+  const before = inc.build(doc);
+  doc = 'Z' + doc;
+  const after = inc.build(doc);
+  assert.strictEqual(after[0].start, 0);
+  assert.strictEqual(after[1].start, 4);
+  assert.strictEqual(after[2].start, 7);
+  // 内容没变的行必须复用同一个对象引用（行组件靠它跳过重渲染）
+  assert.strictEqual(after[1], before[1], '第二行对象应被复用');
+  assert.strictEqual(after[2], before[2], '第三行对象应被复用');
+});
+
+it('md-lines: 同一文本重复 build 返回同一数组引用', () => {
+  const inc = lines.createLineBuilder();
+  const a = inc.build('x\ny');
+  const b = inc.build('x\ny');
+  assert.strictEqual(a, b);
 });
 
 console.log('\n──────────────────────────────');

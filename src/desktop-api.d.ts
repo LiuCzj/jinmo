@@ -21,6 +21,14 @@ export interface DesktopApi {
   setTitle(title: string): Promise<void>;
   /** 上报「有未保存改动」，桌面壳关窗前据此提示保存 */
   setDirty(v: boolean): void;
+  /**
+   * 通知桌面壳「本次保存流程已结束」。
+   *
+   * @param saved 是否真的写盘成功（取消另存为、写盘失败都传 false）
+   *
+   * 关窗时主进程发 `save` 命令后会等这个信号，而不是靠轮询或超时猜。
+   */
+  notifySaveSettled(saved: boolean): void;
   /** 菜单或最近文件打开了某个文件；返回取消订阅函数 */
   onOpenFile(cb: (payload: { path: string; content: string }) => void): () => void;
   /** 菜单命令；返回取消订阅函数 */

@@ -35,6 +35,12 @@ contextBridge.exposeInMainWorld('desktop', {
   setDirty: (v) => ipcRenderer.send('dirty:set', Boolean(v)),
 
   /**
+   * 通知主进程「本次保存流程已结束」。
+   * @param saved 是否真的写盘成功（取消另存为、写盘失败都传 false）
+   */
+  notifySaveSettled: (saved) => ipcRenderer.send('save:settled', Boolean(saved)),
+
+  /**
    * 订阅「菜单或最近文件打开了某个文件」。
    * @param cb 回调，参数为 { path, content }
    * @returns 取消订阅的函数

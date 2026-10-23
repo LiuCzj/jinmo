@@ -134,6 +134,15 @@ function lineHtml(line: string, inFence: boolean): string {
 }
 
 /**
+ * 单行着色结果的缓存。
+ *
+ * 源码模式下每击键都会重跑整篇着色，而其中只有一行变了。
+ * 键里带围栏状态：同一行文本在围栏内外是两种着色。
+ */
+const CACHE_MAX = 8000;
+const cache = new Map<string, string>();
+
+/**
  * 把整篇 Markdown 逐行转成着色后的 HTML。
  *
  * 返回数组而非拼接串：调用方按行渲染成块级元素，行号才能随折行正确对齐。
@@ -145,7 +154,14 @@ export function highlightMarkdown(src: string): string[] {
   const out: string[] = [];
   let inFence = false;
   for (const line of src.split('\n')) {
-    out.push(lineHtml(line, inFence));
+    const key = (inFence ? '1' : '0') + line;
+    let html = cache.get(key);
+    if (html === undefined) {
+      html = lineHtml(line, inFence);
+      if (cache.size >= CACHE_MAX) cache.clear();
+      cache.set(key, html);
+    }
+    out.push(html);
     if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
   }
   return out;
